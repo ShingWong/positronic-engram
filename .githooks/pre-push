@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -e
+# filename block
+blocked=$(git diff --cached --name-only 2>/dev/null | grep -E "brain_henry/state|memory\.db|people\.json|kairos_brain\.py|index\.jsonl|datasets/" 2>/dev/null || true)
+if [ -n "$blocked" ]; then echo "BLOCKED (filename):"; echo "$blocked"; exit 1; fi
+# content block — henry@ anywhere (exclude hook files themselves which legitimately contain the pattern)
+if git diff --cached -G "henry@" --name-only -- . ":(exclude).githooks" 2>/dev/null | grep -q .; then echo "BLOCKED (content henry@):"; git diff --cached -G "henry@" --name-only -- . ":(exclude).githooks"; exit 1; fi
+# also content grep fallback
+if git diff --cached -- . ":(exclude).githooks" 2>/dev/null | grep -q "henry@"; then echo "BLOCKED (content henry@)"; exit 1; fi
+exit 0
