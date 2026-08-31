@@ -113,7 +113,7 @@ Two honest numbers, two different layers:
 - **The store** — `p95 0.7 ms` on the synthetic harness. SQLite + FTS5 + RRF → the "0.5–2 ms" you see in demos.
 - **The full pipeline** — `p95 ~210 s` end-to-end on real LongMemEval `n=50` (ingest ~550 messages, embed, two LLM passes, judge). Recall `0.58` with memory vs `0.14` without → **Δ 0.44**.
 
-Bonus: top-8 retrieval uses **~242 tokens** vs **~4,496** for the full haystack — about **1/20th** of the context at 32k.
+Bonus: top-8 retrieval uses a flat **~242 tokens** vs the full haystack (which grows from **~2,249** at 4k to **~18,000** at 32k) — about **1/10th to 1/74th** of the context, with recall@1 1.0.
 
 > The store is instant. The pipeline takes what the LLMs take. Both are real.
 
@@ -181,7 +181,7 @@ pip install -e engine   # or: pip install --break-system-packages -e engine
 
 - **E7 synthetic** — 55 events → 78 weeks → `55/55/35/7` (`archival/long_term/balanced/short_term`), `profile_order_ok`, 14 unit tests green.
 - **LongMemEval real `n=50`** — `archival/local` `0.58` vs `0.14` without → `Δ 0.44`, `fallback 0.0`, `recall 1.0` (clean single run).
-- **RULER 32k** — top-8 retrieval `242 tok` vs `4,496 tok` full haystack → `1/20` context, accuracy preserved.
+- **RULER 4–32k** — top-8 retrieval flat `242 tok` vs growing full haystack (`2.2k–18k tok`) → `1/10`–`1/74` context, recall@1 1.0 preserved.
 - **Throughput** — ~6k events/s synthetic batch ingestion (H14 gate economics: ~5% encode rate on realistic mix).
 
 Run them yourself:
