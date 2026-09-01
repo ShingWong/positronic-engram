@@ -142,6 +142,27 @@ def test_extraction_can_be_disabled():
     assert n == 0
 
 
+def test_person_cache_reflects_bump_miss_cost():
+    # I2 regression: bump_miss_cost changes weight; the cached person row
+    # must be invalidated so the next gate decision sees the new weight.
+    e, s = mk()
+    e.register_person("p_beta")
+    s.get_person("p_beta")                       # populate _person_cache
+    s.bump_miss_cost("p_beta")                   # weight 0.5 -> 0.55
+    fresh = s.get_person("p_beta")
+    assert fresh["weight"] == 0.55
+
+
+def test_person_cache_reflects_touch_person():
+    # I2: touch_person updates last_seen_tau; cached row must not go stale.
+    e, s = mk()
+    e.register_person("p_beta")
+    s.get_person("p_beta")
+    s.touch_person("p_beta", 42.0)
+    fresh = s.get_person("p_beta")
+    assert fresh["last_seen_tau"] == 42.0
+
+
 # prune default (tau_now=None) must derive "now" for the objects pass too,
 # not only for the episode loop. Regression for:
 #   prune: unsupported operand type(s) for -: 'NoneType' and 'float'
@@ -160,3 +181,29 @@ def test_prune_default_now_ages_objects():
     status = s.conn.execute(
         "SELECT status FROM object WHERE id=?", (oid,)).fetchone()["status"]
     assert status in ("dormant", "forgotten")
+
+
+def test_prune_objects_use_per_domain_now_not_global():
+    # C1 regression: object in a QUIET stream must not be aged against a
+    # hot stream's global MAX(tau). now must derive per-domain.
+    e, s = mk()
+    hot_did = e.attach_stream("hot:stream", "hot_domain")
+    quiet_did = e.attach_stream("quiet:stream", "quiet_domain")
+    s.attach_stream("hot:stream", hot_did)
+    s.attach_stream("quiet:stream", quiet_did)
+    s.conn.execute("UPDATE stream SET tau=1500.0, mono=500 WHERE stream=?",
+                   ("hot:stream",))
+    s.conn.execute("UPDATE stream SET tau=1.0, mono=1 WHERE stream=?",
+                   ("quiet:stream",))
+    wall = datetime.now(timezone.utc)
+    s.get_or_create_object(
+        domain_id=hot_did, kind="entity", canonical_name="hot-thing",
+        wall=wall, tau=1500.0)
+    quiet_obj = s.get_or_create_object(
+        domain_id=quiet_did, kind="entity", canonical_name="quiet-thing",
+        wall=wall, tau=1.0)
+    rep = e.prune()                                   # tau_now=None
+    quiet_status = s.conn.execute(
+        "SELECT status FROM object WHERE id=?", (quiet_obj,)).fetchone()["status"]
+    assert quiet_status not in ("dormant", "forgotten")
+    assert rep.objects_forgotten == 0

@@ -36,7 +36,12 @@ class FlatVectorIndex:
         self._dirty = True
 
     def add(self, eid: str, vec: list[float]) -> None:
-        self._vecs[eid] = [float(x) for x in vec]
+        vec = [float(x) for x in vec]
+        if self._vecs and len(vec) != len(next(iter(self._vecs.values()))):
+            raise ValueError(
+                f"dimension mismatch: {len(vec)} != "
+                f"{len(next(iter(self._vecs.values())))}")
+        self._vecs[eid] = vec
         self._dirty = True
 
     def remove(self, eid: str) -> None:
@@ -73,6 +78,8 @@ class FlatVectorIndex:
         import math
         import numpy as np
         q = np.asarray([float(x) for x in qvec], dtype=np.float32)
+        if q.ndim != 1 or q.shape[0] != self._mat.shape[1]:
+            return []                   # incompatible cue dimension
         qn = float(np.linalg.norm(q)) or 1e-9
         sims = (self._mat @ (q / qn))
         idx = np.argsort(-sims)[:k]

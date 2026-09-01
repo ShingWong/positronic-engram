@@ -67,6 +67,33 @@ def test_archival_never_fades():
     assert rep.expired == 0 and rep.day_merged == 0   # prune = no-op
 
 
+def test_prune_ladder_reads_profile_thresholds():
+    # I1 regression: prune_merge/prune_expire declared per-profile must be
+    # honored, not the hardcoded 0.35/0.05. Same strength episode (decay
+    # identical), same Δτ — only the profile ladder differs.
+    # retain = exp(-130/100) = 0.272:
+    #   balanced prune_merge=0.35  -> 0.272 < 0.35  day_merged
+    #   short_term prune_merge=0.20 -> 0.272 > 0.20  survives
+    from memeng.models import EpisodeRecord, Provenance
+    outcomes = {}
+    for prof, expect_demote in (("balanced", True), ("short_term", False)):
+        e, s = mk(prof)
+        e.attach_stream("mail:p1", "mail")
+        did = s.get_stream("mail:p1")["domain_id"]
+        rec = EpisodeRecord(
+            id=uuid.uuid4(), stream="mail:p1", kind="message",
+            wall=datetime(2026, 1, 1, tzinfo=timezone.utc), mono=1,
+            tau=0.0, persons=[], subject_norm=None, salience=0.5,
+            tier=Tier.NORMAL, strength=100.0,
+            provenance=Provenance.WITNESSED, fuzz_lo=None, fuzz_hi=None,
+            precision_src="exact", is_anchor=False, features={})
+        s.insert_episode(rec, did)
+        rep = e.prune(tau_now=130.0)
+        outcomes[prof] = rep.day_merged > 0
+    assert outcomes["balanced"] is True
+    assert outcomes["short_term"] is False
+
+
 def test_short_term_fades_fast():
     e, _ = mk("short_term")
     feed(e, 3)

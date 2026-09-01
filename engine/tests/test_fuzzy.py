@@ -76,6 +76,22 @@ def test_rrf_fuses_heterogeneous_channels():
     assert "c" == fused[-1] or "c" not in fused
 
 
+# I8: a mixed-dimension vector must not permanently break semantic recall
+def test_add_rejects_dimension_mismatch():
+    idx = FlatVectorIndex()
+    idx.add("a", [1.0, 0.0, 0.0])
+    with pytest.raises(ValueError):
+        idx.add("bad", [1.0, 0.0])      # 2-dim vs existing 3-dim
+
+
+def test_search_skips_incompatible_cue_dimension():
+    idx = FlatVectorIndex()
+    idx.add("a", [1.0, 0.0, 0.0])
+    idx.add("b", [0.0, 1.0, 0.0])
+    hits = idx.search([1.0, 0.0], k=2)  # 2-dim cue vs 3-dim rows
+    assert hits == []
+
+
 # activate(): semantic + lexical fuse; dual-channel hits rank first
 def test_activate_fuses_channels():
     e, s = mk()

@@ -392,6 +392,7 @@ class SQLiteStore:
         self.conn.execute(
             "UPDATE person SET last_seen_tau=? WHERE pid=?", (tau, pid))
         self._commit()
+        self._person_cache.pop(pid, None)
 
     def set_person_weight(self, pid: str, weight: float) -> None:
         self.conn.execute("UPDATE person SET weight=? WHERE pid=?",
@@ -404,6 +405,7 @@ class SQLiteStore:
             "UPDATE person SET miss_costs=miss_costs+1, "
             "weight=MIN(1.0, weight+0.05) WHERE pid=?", (pid,))
         self._commit()
+        self._person_cache.pop(pid, None)
 
     # -- tau / mono ---------------------------------------------------------
     def stream_time(self, stream: str) -> tuple[float, int]:

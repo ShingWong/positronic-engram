@@ -468,13 +468,25 @@ class MemoryEngine:
         if domain and did is not None:
             eps = [e for e in eps if e.domain_id == did]
         rep["scanned"] = len(eps)
+        dom_cache: dict[int, dict] = {}
         for ep in eps:
             now = tau_now if tau_now is not None else \
                 self.store.stream_time(ep.stream)[0]
             if ep.tier is Tier.FLASHBULB or math.isinf(ep.strength):
                 continue
+            d_id = ep.domain_id if ep.domain_id is not None else \
+                (self.store.get_stream(ep.stream) or {}).get("domain_id")
+            if d_id not in dom_cache:
+                row = self.store.get_domain(d_id) if d_id is not None else None
+                pname = (row or {}).get("retention_profile") or \
+                    self.base_cfg.get("retention_profile", "balanced")
+                dom_cache[d_id] = self.retention_profiles[pname]
+            P = dom_cache[d_id]
+            p_merge, p_expire = P["prune_merge"], P["prune_expire"]
+            if p_merge is None or p_expire is None:
+                continue                        # archival: episodes immortal
             retain = math.exp(-((now - ep.tau) / max(ep.strength, 1e-9)))
-            if retain < 0.05:
+            if retain < p_expire:
                 self.store.write_residue(str(ep.id), usage_count=1,
                                          persons=ep.persons,
                                          anchor_edges=int(ep.is_anchor))
@@ -482,7 +494,8 @@ class MemoryEngine:
                                           subject_norm=None)
                 rep["expired"] += 1
                 rep["residues"] += 1
-            elif retain < 0.35:
+                rep["week_merged"] += 1
+            elif retain < p_merge:
                 self.store.update_episode(str(ep.id), level="day_token",
                                           subject_norm=None)
                 rep["day_merged"] += 1
@@ -500,11 +513,7 @@ class MemoryEngine:
             "GROUP BY object_id) s ON s.object_id=o.id "
             "WHERE o.status != 'forgotten'").fetchall()
         dom_cache = {}
-        now = tau_now
-        if now is None:
-            _row = self.store.conn.execute(
-                "SELECT MAX(tau) t FROM stream").fetchone()
-            now = float(_row["t"] or 0.0)
+        now_cache: dict[int, float] = {}
         for r in dom_rows:
             d_id = int(r["domain_id"])
             if d_id not in dom_cache:
@@ -512,11 +521,18 @@ class MemoryEngine:
                 pname = row.get("retention_profile") or \
                     self.base_cfg.get("retention_profile", "balanced")
                 dom_cache[d_id] = self.retention_profiles[pname]
+                if tau_now is not None:
+                    now_cache[d_id] = tau_now
+                else:
+                    _row = self.store.conn.execute(
+                        "SELECT COALESCE(MAX(tau),0.0) t FROM stream "
+                        "WHERE domain_id=?", (d_id,)).fetchone()
+                    now_cache[d_id] = float(_row["t"] or 0.0)
             P = dom_cache[d_id]
             od, of_ = P["obj_dormant"], P["obj_forget"]
             if od is None or of_ is None:
                 continue                        # archival: objects immortal
-            dtau = now - float(r["lst"] or 0)
+            dtau = now_cache[d_id] - float(r["lst"] or 0)
             mult = 3.0 if r["sx"] >= 3 else 1.0
             if dtau >= of_ * mult and (
                     r["status"] != "stable" or of_ * mult >= 75 * mult):

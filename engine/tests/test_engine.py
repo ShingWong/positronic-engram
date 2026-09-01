@@ -192,6 +192,7 @@ def test_prune_ladder_and_flashbulb():
     s.insert_episode(flash, 1)
     rep = e.prune(tau_now=200)                     # exp(-200/30) ≈ 0.0013 < 0.05
     assert rep.expired == 1 and rep.residues == 1
+    assert rep.week_merged == 1    # I10: week_token demotion must be counted
     aged = [r for r in s.iter_episodes(level="week_token")]
     assert len(aged) == 1
     survivors = s.iter_episodes(level="event")
