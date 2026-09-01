@@ -92,6 +92,63 @@ def test_multiword_cue_surfaces_partial_matches():
     assert all(not o["fallback"] for o in out)
 
 
+# consolidation mode: 'only' returns just consolidation episodes, 'first'
+# ranks them ahead of live messages regardless of RRF score. Post-fuse view —
+# the fusion itself is unchanged; the mode partitions the result. The
+# consolidation OR channel is kind-scoped so live chatter can't push a
+# matching consolidation out of the pool.
+def test_activate_consolidation_only():
+    e, s = mk()
+    msg = insert_ep(s, str(uuid.uuid4()), tau=90.0,
+                    text="deployed web2 hotfix now")
+    cons = insert_ep(s, str(uuid.uuid4()), tau=10.0,
+                     text="web2 deploy finished cleanly")
+    s.conn.execute(
+        "UPDATE episode SET kind='consolidation' WHERE id=?",
+        (cons,))
+    out = e.activate({"text": "web2 deploy"}, k=8,
+                     consolidation="only")
+    got = {o["episode_id"] for o in out}
+    assert cons in got and msg not in got
+    assert all(o["kind"] == "consolidation" for o in out)
+
+
+def test_activate_consolidation_first():
+    e, s = mk()
+    msg = insert_ep(s, str(uuid.uuid4()), tau=90.0,
+                    text="web2 hotfix shipped")
+    cons = insert_ep(s, str(uuid.uuid4()), tau=5.0,
+                     text="web2 release recap")
+    s.conn.execute(
+        "UPDATE episode SET kind='consolidation' WHERE id=?",
+        (cons,))
+    out = e.activate({"text": "web2"}, k=8, consolidation="first")
+    ids = [o["episode_id"] for o in out]
+    assert ids.index(cons) < ids.index(msg)   # consolidation ahead of live
+    assert out[0]["kind"] == "consolidation"
+    # default mode unchanged — consolidation has no special rank
+    outd = e.activate({"text": "web2"}, k=8)
+    idd = [o["episode_id"] for o in outd]
+    assert idd.index(msg) < idd.index(cons)   # freshness wins by default
+
+
+# a matching consolidation must survive even when many unrelated live messages
+# are ingested after it (kind-scoped OR keeps it in the pool)
+def test_consolidation_only_survives_live_noise():
+    e, s = mk()
+    cons = insert_ep(s, str(uuid.uuid4()), tau=10.0,
+                     text="web2 deploy recap summary")
+    s.conn.execute(
+        "UPDATE episode SET kind='consolidation' WHERE id=?",
+        (cons,))
+    for t in range(40, 60):           # 20 newer live messages, unrelated
+        insert_ep(s, str(uuid.uuid4()), tau=t, text=f"unrelated memo {t}")
+    out = e.activate({"text": "web2 deploy recap"}, k=8,
+                     consolidation="only")
+    assert {o["episode_id"] for o in out} == {cons}
+    assert len(out) == 1              # 'only' is strict: fewer than k is fine
+
+
 # I8: a mixed-dimension vector must not permanently break semantic recall
 def test_add_rejects_dimension_mismatch():
     idx = FlatVectorIndex()

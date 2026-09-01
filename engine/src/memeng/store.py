@@ -567,11 +567,19 @@ class SQLiteStore:
         return [r[0] if isinstance(r[0], str) else r[0][0] if False else
                 (r[0]) for r in rows]
 
-    def fts_search(self, query: str, k: int = 8) -> list[str]:
+    def fts_search(self, query: str, k: int = 8,
+                   kind: str | None = None) -> list[str]:
         try:
-            rows = self.conn.execute(
-                "SELECT id FROM episode_fts WHERE episode_fts MATCH ? "
-                "ORDER BY rank LIMIT ?", (query, k)).fetchall()
+            if kind:
+                rows = self.conn.execute(
+                    "SELECT f.id FROM episode_fts f "
+                    "JOIN episode e ON e.id = f.id "
+                    "WHERE episode_fts MATCH ? AND e.kind = ? "
+                    "ORDER BY rank LIMIT ?", (query, kind, k)).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT id FROM episode_fts WHERE episode_fts MATCH ? "
+                    "ORDER BY rank LIMIT ?", (query, k)).fetchall()
         except Exception:
             return []
         return [r["id"] for r in rows]

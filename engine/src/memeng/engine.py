@@ -354,7 +354,8 @@ class MemoryEngine:
         return result
 
     # -- fuzzy recall (H5/H8: reconstruction channels) -----------------------
-    def activate(self, cue: dict, k: int = 8) -> list[dict]:
+    def activate(self, cue: dict, k: int = 8,
+                 consolidation: str | None = None) -> list[dict]:
         """Fused fuzzy recall. Cue channels (all optional):
           text:      -> lexical FTS5 + semantic embedding (when bound)
           persons:   -> person boost on fusion
@@ -362,6 +363,11 @@ class MemoryEngine:
           tau_now:   -> unused (kept for caller compat)
         Relevance channels are RRF-fused; the recency channel is a FALLBACK
         consulted only when both relevance channels come back empty.
+
+        consolidation mode is a post-fuse view, not a fusion change:
+          None           -> current behavior (freshness/score wins)
+          'only'         -> keep consolidation episodes, drop the rest
+          'first'        -> consolidations first (RRF order), then live, trim k
         """
         with self.tel.stage("activate"):
             channels: list[list[str]] = []
@@ -384,7 +390,19 @@ class MemoryEngine:
             text = cue.get("text")
             if text:
                 fts_ids = self.store.fts_search(text, k=k * 3)
-                if not fts_ids:
+                or_ids: list[str] = []
+                if consolidation:
+                    # consolidation mode searches directly among
+                    # kind='consolidation' episodes with a term-bag OR, so the
+                    # pool is exact — no guessing how deep a matching
+                    # consolidation ranks against live chatter.
+                    terms = [t for t in re.split(r"[^\w]+", text.lower())
+                             if len(t) > 1 and t not in self._FTS_STOP]
+                    if terms:
+                        or_ids = self.store.fts_search(
+                            " OR ".join(f'"{t}"' for t in terms),
+                            k=k * 4, kind="consolidation")
+                elif not fts_ids:
                     # FTS5 implicit-AND: every space-separated token must
                     # co-occur, so a sentence-level cue matches nothing and
                     # the recency fallback swallows the recall with self-echo.
@@ -392,10 +410,13 @@ class MemoryEngine:
                     terms = [t for t in re.split(r"[^\w]+", text.lower())
                              if len(t) > 1 and t not in self._FTS_STOP]
                     if terms:
-                        orq = " OR ".join(f'"{t}"' for t in terms)
-                        fts_ids = self.store.fts_search(orq, k=k * 3)
+                        or_ids = self.store.fts_search(
+                            " OR ".join(f'"{t}"' for t in terms), k=k * 3)
                 if fts_ids:
                     channels.append(fts_ids)
+                    weights.append(1.0)
+                if or_ids:
+                    channels.append(or_ids)
                     weights.append(1.0)
 
             if not channels:
@@ -414,10 +435,11 @@ class MemoryEngine:
                         if full:
                             eps_by_id[eid] = full
 
-            fused = rrf_fuse(channels, k=k, weights=weights)
+            fused = rrf_fuse(channels, k=k if not consolidation else k * 4,
+                         weights=weights)
             persons = set(cue.get("persons") or [])
             out = []
-            for rank, eid in enumerate(fused[:k], 1):
+            for rank, eid in enumerate(fused, 1):
                 ep = eps_by_id.get(eid)
                 pboost = (1.3 if ep and persons & set(ep.persons or [])
                           else 1.0)
@@ -435,9 +457,16 @@ class MemoryEngine:
                     "tau": ep.tau if ep else None,
                     "stream": ep.stream if ep else None,
                     "salience": ep.salience if ep else None,
+                    "kind": ep.kind if ep else None,
                     "person_boost": pboost,
                     "fallback": fallback})
             out.sort(key=lambda d: -d["rrf_score"])
+            if consolidation == "only":
+                out = [d for d in out if d["kind"] == "consolidation"][:k]
+            elif consolidation == "first":
+                cons = [d for d in out if d["kind"] == "consolidation"]
+                live = [d for d in out if d["kind"] != "consolidation"]
+                out = (cons + live)[:k]
             return out
 
     def bind_embedder(self, fn):
