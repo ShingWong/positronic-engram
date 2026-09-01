@@ -567,6 +567,29 @@ class SQLiteStore:
         return [r[0] if isinstance(r[0], str) else r[0][0] if False else
                 (r[0]) for r in rows]
 
+    def stream_neighbors(self, episode_id: str, window: int) -> list[str]:
+        """τ-adjacent episodes (same stream) around an episode, ±window.
+
+        Per-message chunking splits a fact from its context; this reunites the
+        premise and answer messages by returning the closest `window` episodes
+        before and after in the stream's τ order.
+        """
+        row = self.conn.execute(
+            "SELECT stream, tau FROM episode WHERE id=?",
+            (episode_id,)).fetchone()
+        if not row:
+            return []
+        stream, tau = row["stream"], row["tau"]
+        before = self.conn.execute(
+            "SELECT id FROM episode WHERE stream=? AND tau < ? "
+            "ORDER BY tau DESC LIMIT ?", (stream, tau, window)).fetchall()
+        after = self.conn.execute(
+            "SELECT id FROM episode WHERE stream=? AND tau > ? "
+            "ORDER BY tau ASC LIMIT ?", (stream, tau, window)).fetchall()
+        ids = [r[0] for r in reversed(before)] + [episode_id] + \
+              [r[0] for r in after]
+        return ids
+
     def fts_search(self, query: str, k: int = 8,
                    kind: str | None = None) -> list[str]:
         try:

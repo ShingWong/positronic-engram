@@ -23,6 +23,7 @@ name themselves (see telemetry.py).
 """
 from __future__ import annotations
 
+import logging
 import math
 import re
 import uuid
@@ -261,8 +262,8 @@ class MemoryEngine:
                             vec = emb(bt)
                             self.store.set_embedding(str(rec.id), vec)
                             self.vec_index.add(str(rec.id), vec)
-                        except Exception:
-                            pass   # embedding is best-effort, never fails encode
+                        except Exception as e:  # noqa: BLE001
+                            logging.debug("embedding failed (best-effort): %s", e)
                 if cfg.get("entity_extraction", True):
                     try:
                         etext = " ".join(
@@ -355,7 +356,8 @@ class MemoryEngine:
 
     # -- fuzzy recall (H5/H8: reconstruction channels) -----------------------
     def activate(self, cue: dict, k: int = 8,
-                 consolidation: str | None = None) -> list[dict]:
+                 consolidation: str | None = None,
+                 context_window: int = 0) -> list[dict]:
         """Fused fuzzy recall. Cue channels (all optional):
           text:      -> lexical FTS5 + semantic embedding (when bound)
           persons:   -> person boost on fusion
@@ -368,6 +370,10 @@ class MemoryEngine:
           None           -> current behavior (freshness/score wins)
           'only'         -> keep consolidation episodes, drop the rest
           'first'        -> consolidations first (RRF order), then live, trim k
+
+        context_window=N expands each hit's snippet to the ±N τ-adjacent
+        episodes in the same stream, reuniting premise and answer messages
+        that per-message chunking split apart (0 = unchanged).
         """
         with self.tel.stage("activate"):
             channels: list[list[str]] = []
@@ -467,6 +473,22 @@ class MemoryEngine:
                 cons = [d for d in out if d["kind"] == "consolidation"]
                 live = [d for d in out if d["kind"] != "consolidation"]
                 out = (cons + live)[:k]
+            if context_window and out:
+                for d in out:
+                    eid = d["episode_id"]
+                    window = self.store.stream_neighbors(eid, context_window)
+                    frags = []
+                    seen_local: set[str] = set()
+                    for wid in window:
+                        if wid in seen_local:
+                            continue
+                        seen_local.add(wid)
+                        wep = eps_by_id.get(wid) or self.store.get_episode(wid)
+                        if wep:
+                            frags.append(
+                                (wep.features.get("body_text") or "")[:400])
+                    d["snippet"] = "\n".join(
+                        f for f in frags if f)[:3000]
             return out
 
     def bind_embedder(self, fn):

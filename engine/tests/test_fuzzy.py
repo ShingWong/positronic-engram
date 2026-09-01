@@ -36,6 +36,7 @@ def mk():
 
 def insert_ep(s, eid, stream="mail:p1", tau=10.0, text=None,
               embed=None, persons=("p_a",), tier=Tier.NORMAL, strength=100.0):
+    features = {"body_text": text} if text else {}
     rec = EpisodeRecord(
         id=uuid.UUID(eid) if isinstance(eid, str) else eid,
         stream=stream, kind="message",
@@ -43,7 +44,7 @@ def insert_ep(s, eid, stream="mail:p1", tau=10.0, text=None,
         mono=1, tau=tau, persons=list(persons), subject_norm=text,
         salience=0.5, tier=tier, strength=strength,
         provenance=Provenance.WITNESSED, fuzz_lo=None, fuzz_hi=None,
-        precision_src="exact", is_anchor=False, features={})
+        precision_src="exact", is_anchor=False, features=features)
     s.insert_episode(rec, 1)
     if embed is not None:
         s.set_embedding(str(rec.id), embed)
@@ -147,6 +148,50 @@ def test_consolidation_only_survives_live_noise():
                      consolidation="only")
     assert {o["episode_id"] for o in out} == {cons}
     assert len(out) == 1              # 'only' is strict: fewer than k is fine
+
+
+# context_window: per-message chunking splits a fact from its retrieval
+# context (LongMemEval failure mode). With context_window=N, each hit's
+# snippet is expanded to the ±N τ-adjacent episodes in the same stream, so
+# the premise message and its answer message are reunited even when the
+# premise outranks the answer.
+def test_activate_context_window_reunites_answer():
+    e, s = mk()
+    premise = insert_ep(s, str(uuid.uuid4()), tau=10.0, stream="chat:1",
+                        text="I redeemed a $5 coupon on coffee creamer")
+    answer = insert_ep(s, str(uuid.uuid4()), tau=11.0, stream="chat:1",
+                       text="the coupon was redeemed at Target")
+    insert_ep(s, str(uuid.uuid4()), tau=12.0, stream="chat:1",
+              text="unrelated followup chat")
+    insert_ep(s, str(uuid.uuid4()), tau=5.0, stream="other:1",
+              text="another unrelated thread")
+    # default: top hit is the premise; its snippet alone lacks the answer
+    out = e.activate({"text": "coupon"}, k=8)
+    top = next(o for o in out if o["episode_id"] == premise)
+    assert "Target" not in (top["snippet"] or "")
+    # with context_window=1, the answer message joins the snippet
+    out2 = e.activate({"text": "coupon"}, k=8, context_window=1)
+    top2 = next(o for o in out2 if o["episode_id"] == premise)
+    assert "Target" in (top2["snippet"] or "")
+    # the unrelated stream/thread must NOT leak into the window
+    assert "another unrelated" not in (top2["snippet"] or "")
+    # τ=12 is 2 steps from premise τ=10 → outside window=1, correctly excluded
+    assert "unrelated followup" not in (top2["snippet"] or "")
+
+
+def test_activate_context_window_zero_unchanged():
+    e, s = mk()
+    premise = insert_ep(s, str(uuid.uuid4()), tau=10.0, stream="chat:1",
+                        text="redeemed a coupon at the store")
+    insert_ep(s, str(uuid.uuid4()), tau=11.0, stream="chat:1",
+              text="answer message with the detail")
+    out = e.activate({"text": "coupon"}, k=8)
+    top = next(o for o in out if o["episode_id"] == premise)
+    assert "detail" not in (top["snippet"] or "")
+    # explicit 0 == default
+    out0 = e.activate({"text": "coupon"}, k=8, context_window=0)
+    top0 = next(o for o in out0 if o["episode_id"] == premise)
+    assert top0["snippet"] == top["snippet"]
 
 
 # I8: a mixed-dimension vector must not permanently break semantic recall
