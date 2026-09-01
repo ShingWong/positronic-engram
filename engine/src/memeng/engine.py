@@ -500,6 +500,11 @@ class MemoryEngine:
             "GROUP BY object_id) s ON s.object_id=o.id "
             "WHERE o.status != 'forgotten'").fetchall()
         dom_cache = {}
+        now = tau_now
+        if now is None:
+            _row = self.store.conn.execute(
+                "SELECT MAX(tau) t FROM stream").fetchone()
+            now = float(_row["t"] or 0.0)
         for r in dom_rows:
             d_id = int(r["domain_id"])
             if d_id not in dom_cache:
@@ -511,7 +516,7 @@ class MemoryEngine:
             od, of_ = P["obj_dormant"], P["obj_forget"]
             if od is None or of_ is None:
                 continue                        # archival: objects immortal
-            dtau = tau_now - float(r["lst"] or 0)
+            dtau = now - float(r["lst"] or 0)
             mult = 3.0 if r["sx"] >= 3 else 1.0
             if dtau >= of_ * mult and (
                     r["status"] != "stable" or of_ * mult >= 75 * mult):

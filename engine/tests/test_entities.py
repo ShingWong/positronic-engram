@@ -140,3 +140,23 @@ def test_extraction_can_be_disabled():
     n = s.conn.execute(
         "SELECT COUNT(*) c FROM object WHERE kind='entity'").fetchone()["c"]
     assert n == 0
+
+
+# prune default (tau_now=None) must derive "now" for the objects pass too,
+# not only for the episode loop. Regression for:
+#   prune: unsupported operand type(s) for -: 'NoneType' and 'float'
+def test_prune_default_now_ages_objects():
+    e, s = mk()
+    e.new_event(_sess_event("web2 deploy", "shipped to web2"))
+    oid = s.conn.execute(
+        "SELECT id FROM object WHERE kind='entity' AND "
+        "canonical_name='web2'").fetchone()["id"]
+    s.conn.execute(
+        "UPDATE object SET first_seen_tau=0, last_seen_tau=0 WHERE id=?",
+        (oid,))
+    s.conn.execute("UPDATE stream SET tau=1500.0, mono=500 WHERE stream=?", ("kairos:sessions",))
+    rep = e.prune()                                   # tau_now defaults to None
+    assert rep.objects_dormant + rep.objects_forgotten >= 1
+    status = s.conn.execute(
+        "SELECT status FROM object WHERE id=?", (oid,)).fetchone()["status"]
+    assert status in ("dormant", "forgotten")

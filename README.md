@@ -75,6 +75,8 @@ Same 55 messages, 78 weeks, four policies (`engine.py:48`):
 | `archival` | 1e6 | forever | 55 / 55 |
 | `short_term` | 6 | days | 7 / 55 |
 
+> **Demotion, not deletion.** Episodes below 0.35 drop to `day_token`; below 0.05 to `week_token` — they are never deleted (`expired` stays 0). The `@Week 78` column counts only `level="event"` episodes remaining after `prune()`.
+
 `balanced` is the everyday default. `archival` never forgets — it grows forever, so it's gated behind a confirm. Pruning follows a weekly ladder: `0.35 → day_token 0.05 → expired` (`engine.py:443`).
 
 ---
