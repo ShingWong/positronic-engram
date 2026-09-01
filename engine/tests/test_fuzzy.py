@@ -23,7 +23,7 @@ import pytest
 
 from memeng.engine import MemoryEngine
 from memeng.fuzzy import FlatVectorIndex, rrf_fuse
-from memeng.models import EpisodeRecord, Event, Provenance, Tier
+from memeng.models import EpisodeRecord, Provenance, Tier
 from memeng.store import SQLiteStore
 
 
@@ -74,6 +74,22 @@ def test_rrf_fuses_heterogeneous_channels():
     assert set(fused[:2]) == {"a", "b"}
     # single-channel items rank below dual-channel items
     assert "c" == fused[-1] or "c" not in fused
+
+
+# multi-word cues: FTS5 implicit-AND requires every token to co-occur, so a
+# sentence-level cue (readability conclusion swap reviewer feedback tau) would
+# match nothing against an episode holding only a subset (readability ... swap)
+# and fall back to recency — the self-echo bug. The lexical channel must retry
+# with a term-bag OR so partial matches surface.
+def test_multiword_cue_surfaces_partial_matches():
+    e, s = mk()
+    eid = insert_ep(s, str(uuid.uuid4()), tau=10.0,
+                    text="readability pass on the paper conclusion swap")
+    out = e.activate(
+        {"text": "readability conclusion swap reviewer feedback tau"}, k=8)
+    ids = {o["episode_id"] for o in out}
+    assert eid in ids
+    assert all(not o["fallback"] for o in out)
 
 
 # I8: a mixed-dimension vector must not permanently break semantic recall
@@ -188,4 +204,4 @@ def test_recall_output_payload_fields():
     assert row["salience"] == 0.5
 
 
-from datetime import datetime  # noqa: E402
+from datetime import datetime

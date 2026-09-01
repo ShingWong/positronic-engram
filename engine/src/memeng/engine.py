@@ -24,14 +24,14 @@ name themselves (see telemetry.py).
 from __future__ import annotations
 
 import math
+import re
 import uuid
-from typing import Any
 from datetime import datetime, timezone
+from typing import Any
 
 from .entities import extract_entities
-from .models import (Event, EventResult, GateVerdict, Prediction,
-                     PruneReport, Tier)
 from .fuzzy import FlatVectorIndex, rrf_fuse
+from .models import Event, EventResult, GateVerdict, Prediction, PruneReport, Tier
 from .store import SQLiteStore
 from .telemetry import Telemetry
 from .triggers import TriggerBus
@@ -42,6 +42,11 @@ def utcnow() -> datetime:
 
 
 class MemoryEngine:
+    # FTS5 OR-term bag excludes high-frequency noise words so a sentence-level
+    # cue's OR retry ranks on content terms, not filler.
+    _FTS_STOP = frozenset(
+        ["a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "in", "is", "it", "of", "on", "or", "that", "the", "this", "to", "was", "were", "with"])
+
     def __init__(self, store: SQLiteStore, config: dict | None = None) -> None:
         self.store = store
         cfg = {
@@ -379,6 +384,16 @@ class MemoryEngine:
             text = cue.get("text")
             if text:
                 fts_ids = self.store.fts_search(text, k=k * 3)
+                if not fts_ids:
+                    # FTS5 implicit-AND: every space-separated token must
+                    # co-occur, so a sentence-level cue matches nothing and
+                    # the recency fallback swallows the recall with self-echo.
+                    # Retry with a term-bag OR so partial matches surface.
+                    terms = [t for t in re.split(r"[^\w]+", text.lower())
+                             if len(t) > 1 and t not in self._FTS_STOP]
+                    if terms:
+                        orq = " OR ".join(f'"{t}"' for t in terms)
+                        fts_ids = self.store.fts_search(orq, k=k * 3)
                 if fts_ids:
                     channels.append(fts_ids)
                     weights.append(1.0)
@@ -549,4 +564,4 @@ def actual_key_val_ok(actual, expected) -> bool:
     return actual is not None and str(actual) == str(expected)
 
 
-import time  # noqa: E402  (used for stage timing)
+import time
