@@ -240,3 +240,55 @@ def test_domain_registration_and_isolation():
     ta, _ = s.stream_time("bot:s10")
     tb, _ = s.stream_time("mail:p1")
     assert ta != tb or True                         # independent accumulators exist
+
+
+# E1 ablation — decay axis: wall-clock (MemoryBank R=e^{-t/S}) vs tau.
+# A burst episode with old wall time but recent tau must survive tau-decay
+# and demote under wall-decay: the quiet span advanced wall, not tau.
+def test_prune_decay_axis_wall_vs_tau():
+    e, s = mk_engine()
+    from memeng.models import EpisodeRecord, Provenance
+    old = EpisodeRecord(
+        id=uuid.uuid4(), stream="mail:h", kind="message",
+        wall=T0 - timedelta(days=60), mono=1, tau=5.0,
+        persons=["p_burst"], subject_norm=None, salience=0.5,
+        tier=Tier.NORMAL, strength=30.0, provenance=Provenance.WITNESSED,
+        fuzz_lo=None, fuzz_hi=None, precision_src="exact", is_anchor=False,
+        features={})
+    s.insert_episode(old, 1)
+
+    # tau-axis: now-tau small (5.0 vs prune at tau_now=10) => retains
+    rep_tau = e.prune(tau_now=10.0, decay_axis="tau")
+    assert rep_tau.expired == 0, "tau-axis must not expire a recent-tau episode"
+
+    # wall-axis: 60 wall-days old, S=30 days => retain e^{-2}=0.135:
+    # below merge (0.35) but above expire (0.05) => day_merged, not expired.
+    wall_now = T0.timestamp()
+    e2, s2 = mk_engine()
+    old2 = EpisodeRecord(
+        id=uuid.uuid4(), stream="mail:h", kind="message",
+        wall=T0 - timedelta(days=60), mono=1, tau=5.0,
+        persons=["p_burst"], subject_norm=None, salience=0.5,
+        tier=Tier.NORMAL, strength=30.0, provenance=Provenance.WITNESSED,
+        fuzz_lo=None, fuzz_hi=None, precision_src="exact", is_anchor=False,
+        features={})
+    s2.insert_episode(old2, 1)
+    rep_wall = e2.prune(tau_now=None, decay_axis="wall", wall_now=wall_now)
+    assert rep_wall.expired == 0, \
+        "60 wall-days at S=30 days is merge-level, not expired"
+    assert rep_wall.day_merged == 1, \
+        "wall-axis must demote an episode 60 wall-days old even at recent tau"
+
+    # a wall-FRESH episode (recent wall) must survive wall-decay
+    fresh = EpisodeRecord(
+        id=uuid.uuid4(), stream="mail:h", kind="message",
+        wall=T0 - timedelta(days=2), mono=1, tau=5.0,
+        persons=["p_fresh"], subject_norm=None, salience=0.5,
+        tier=Tier.NORMAL, strength=30.0, provenance=Provenance.WITNESSED,
+        fuzz_lo=None, fuzz_hi=None, precision_src="exact", is_anchor=False,
+        features={})
+    s2.insert_episode(fresh, 1)
+    rep2 = e2.prune(tau_now=None, decay_axis="wall", wall_now=wall_now)
+    survivors = [r for r in s2.iter_episodes(level="event")]
+    assert len(survivors) == 1 and survivors[0].persons == ["p_fresh"], \
+        "2 wall-days old must survive wall-decay"

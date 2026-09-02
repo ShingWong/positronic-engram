@@ -526,9 +526,18 @@ class MemoryEngine:
 
     # -----------------------------------------------------------------------
     def prune(self, tau_now: float | None = None, *,
-              domain: str | None = None) -> PruneReport:
+              domain: str | None = None,
+              decay_axis: str = "tau",
+              wall_now: float | None = None) -> PruneReport:
         """Selective pruning. domain='kairos' scopes the pass to one domain —
-        the foundation for per-origin memory hygiene."""
+        the foundation for per-origin memory hygiene.
+
+        decay_axis selects the clock driving the decay ladder (E1 ablation):
+        - "tau"  (default): R = exp(-(tau_now - tau)/S), the polytemporal axis
+        - "wall" (MemoryBank-style R = exp(-age/S)): age is wall-clock age in
+          DAYS (so S reads in days, matching the tau profile's scale).
+          wall_now is a unix timestamp (seconds).
+        """
         rep = {"scanned": 0, "day_merged": 0, "week_merged": 0,
                "expired": 0, "residues": 0}
         eps = self.store.iter_episodes()
@@ -536,10 +545,27 @@ class MemoryEngine:
         if domain and did is not None:
             eps = [e for e in eps if e.domain_id == did]
         rep["scanned"] = len(eps)
+        # E1 ablation: decay axis selects the clock. tau-axis uses the
+        # polytemporal accumulator; wall-axis uses wall-clock age (unix sec).
+        wall_axis = decay_axis == "wall"
+        wall_base = wall_now if wall_now is not None else \
+            (self.store.conn.execute(
+                "SELECT COALESCE(MAX(wall),0) w FROM episode"
+            ).fetchone()["w"])
         dom_cache: dict[int, dict] = {}
         for ep in eps:
-            now = tau_now if tau_now is not None else \
-                self.store.stream_time(ep.stream)[0]
+            if wall_axis:
+                # ep.wall is a datetime; age on the wall clock in DAYS so S
+                # (from the retention profile) reads in the same day units.
+                ep_wall = ep.wall
+                if hasattr(ep_wall, "timestamp"):
+                    age_days = (wall_base - ep_wall.timestamp()) / 86400.0
+                else:  # pragma: no cover - defensive
+                    age_days = float(wall_base) / 86400.0
+                now = age_days
+            else:
+                now = tau_now if tau_now is not None else \
+                    self.store.stream_time(ep.stream)[0]
             if ep.tier is Tier.FLASHBULB or math.isinf(ep.strength):
                 continue
             d_id = ep.domain_id if ep.domain_id is not None else \
@@ -553,7 +579,11 @@ class MemoryEngine:
             p_merge, p_expire = P["prune_merge"], P["prune_expire"]
             if p_merge is None or p_expire is None:
                 continue                        # archival: episodes immortal
-            retain = math.exp(-((now - ep.tau) / max(ep.strength, 1e-9)))
+            if wall_axis:
+                # now = wall age in seconds; strength S is in wall seconds
+                retain = math.exp(-(now / max(ep.strength, 1e-9)))
+            else:
+                retain = math.exp(-((now - ep.tau) / max(ep.strength, 1e-9)))
             if retain < p_expire:
                 self.store.write_residue(str(ep.id), usage_count=1,
                                          persons=ep.persons,
