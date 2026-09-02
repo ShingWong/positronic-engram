@@ -25,8 +25,6 @@ Swap targets when scale demands: sqlite-vec, pgvector, paper-2 engine.
 """
 from __future__ import annotations
 
-import math
-
 
 class FlatVectorIndex:
     def __init__(self) -> None:
@@ -74,8 +72,6 @@ class FlatVectorIndex:
             self._rebuild()
         if self._mat is None:
             return []
-
-        import math
         import numpy as np
         q = np.asarray([float(x) for x in qvec], dtype=np.float32)
         if q.ndim != 1 or q.shape[0] != self._mat.shape[1]:

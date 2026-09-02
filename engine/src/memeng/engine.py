@@ -30,6 +30,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 from .entities import extract_entities
 from .fuzzy import FlatVectorIndex, rrf_fuse
 from .models import Event, EventResult, GateVerdict, Prediction, PruneReport, Tier
@@ -263,7 +265,7 @@ class MemoryEngine:
                             self.store.set_embedding(str(rec.id), vec)
                             self.vec_index.add(str(rec.id), vec)
                         except Exception as e:  # noqa: BLE001
-                            logging.debug("embedding failed (best-effort): %s", e)
+                            logger.debug("embedding failed (best-effort): %s", e)
                 if cfg.get("entity_extraction", True):
                     try:
                         etext = " ".join(
@@ -279,8 +281,8 @@ class MemoryEngine:
                                 str(rec.id), oid_, channel="text")
                             self.store.touch_object(
                                 oid_, new_tau, event.wall)
-                    except Exception:
-                        pass   # entities are best-effort, never fail encode
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("entity extraction failed (best-effort): %s", e)
             bus.emit("episode_encoded", new_tau, episode_id=str(rec.id),
                      level="event", tier=tier.value)
             if is_anchor:

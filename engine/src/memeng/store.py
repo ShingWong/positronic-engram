@@ -25,10 +25,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
 import struct
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .models import EpisodeRecord, Provenance, Tier
 
@@ -316,7 +315,7 @@ class SQLiteStore:
             return int(r["id"])
         cur = self.conn.execute(
             "INSERT INTO domain(name,created_wall) VALUES('default',?)",
-            (datetime.utcnow().isoformat(),))
+            (datetime.now(timezone.utc).isoformat(),))
         self._commit()
         return int(cur.lastrowid)
 
@@ -325,7 +324,7 @@ class SQLiteStore:
         self.conn.execute(
             "INSERT INTO domain(name,created_wall,threshold,burst_threshold) "
             "VALUES(?,?,?,?) ON CONFLICT(name) DO NOTHING",
-            (name, datetime.utcnow().isoformat(), threshold, burst_threshold))
+            (name, datetime.now(timezone.utc).isoformat(), threshold, burst_threshold))
         self._commit()
         r = self.conn.execute("SELECT id FROM domain WHERE name=?",
                               (name,)).fetchone()
