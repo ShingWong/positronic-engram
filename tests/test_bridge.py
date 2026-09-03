@@ -27,8 +27,8 @@ for p in (HERE, Path("/usr/local/devel/positronic/positronic-private")):
         sys.path.insert(0, str(p))
 sys.path.insert(0, str(HERE / "engine" / "src"))
 
-import kairos_brain as kb  # noqa: E402
-from memeng.models import Event  # noqa: E402
+import kairos_brain as kb
+from memeng.models import Event
 
 
 def _fresh(tmp_path, monkeypatch):

@@ -46,6 +46,7 @@ def dhash_hex(img_bytes: bytes, size: int = 8) -> str | None:
     Returns 16-hex-char string (64 bits) or None if not decodable as image."""
     try:
         import io
+
         from PIL import Image
         img = Image.open(io.BytesIO(img_bytes))
         img = img.convert("L").resize((size + 1, size))
@@ -57,14 +58,14 @@ def dhash_hex(img_bytes: bytes, size: int = 8) -> str | None:
                 right = px[row * (size + 1) + col + 1]
                 bits.append("1" if left > right else "0")
         return f"{int(''.join(bits), 2):0{size * size // 4}x}"
-    except Exception:
+    except (OSError, ValueError, TypeError):
         return None
 
 
 def hamming(hex_a: str, hex_b: str) -> int:
     if not hex_a or not hex_b or len(hex_a) != len(hex_b):
         return 64
-    return bin(int(hex_a, 16) ^ int(hex_b, 16)).count("1")
+    return (int(hex_a, 16) ^ int(hex_b, 16)).bit_count()
 
 
 def classify_image(store, img_bytes: bytes,
@@ -92,11 +93,12 @@ def classify_image(store, img_bytes: bytes,
     w = h = None
     try:
         import io
+
         from PIL import Image
         img = Image.open(io.BytesIO(img_bytes))
         w, h = img.size
-    except Exception:
-        pass
+    except (OSError, ValueError):
+        pass  # non-decodable -> phash is None below -> "not-image" verdict
 
     if phash is None:
         return {"verdict": "not-image", "action": "ignore",
