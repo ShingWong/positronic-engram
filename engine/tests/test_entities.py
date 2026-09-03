@@ -19,8 +19,8 @@
 """Deterministic technical-entity extraction tests."""
 from datetime import datetime, timezone
 
-from memeng.entities import extract_entities
 from memeng.engine import MemoryEngine
+from memeng.entities import extract_entities
 from memeng.models import Event
 from memeng.store import SQLiteStore
 

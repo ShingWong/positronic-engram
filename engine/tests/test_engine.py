@@ -20,8 +20,6 @@ import math
 import uuid
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from memeng.engine import MemoryEngine
 from memeng.models import Event, Tier
 from memeng.store import SQLiteStore

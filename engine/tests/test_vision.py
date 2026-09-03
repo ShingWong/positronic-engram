@@ -18,17 +18,15 @@
 
 """Vision gate tests — signature recognition lifecycle (H14 at perception layer)."""
 import io
-import uuid
 
 import pytest
 
 pytest.importorskip("PIL")
 
-from PIL import Image, ImageDraw
-
 from memeng.engine import MemoryEngine
 from memeng.store import SQLiteStore
 from memeng.vision import classify_image, dhash_hex, hamming
+from PIL import Image, ImageDraw
 
 
 def mk():

@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -71,19 +72,82 @@ class MemoryEngine:
 
         # ── retention profiles: application-controlled forgetting ─────────
         # Same brain hardware; the POLICY differs per deployment/domain.
+        #
+        # KNOB REFERENCE (agents + contributors — read before tuning):
+        #
+        # Episode decay (the verbatim event log):
+        #   S_base      — baseline "strength" an episode is born with, in τ
+        #                 units. Higher = episode survives more τ before
+        #                 decay. Retention = exp(-Δτ/strength), so strength
+        #                 is the half-life in τ.
+        #   S_arousal   — how much a unit of event arousal adds to strength
+        #                 (strength = S_base + S_arousal × arousal). Lets
+        #                 emotionally/gain-charged episodes outlive flat ones.
+        #   prune_merge — retain threshold: below this the episode is demoted
+        #                 to a day-token (subject stripped, FTS kept).
+        #   prune_expire— retain threshold: below this the episode is
+        #                 expired → residue written, content archived away.
+        #
+        # Object (entity) decay — the IP layer:
+        #   obj_dormant — τ of no-sightings before an object goes dormant.
+        #   obj_forget  — τ of no-sightings before an object is forgotten.
+        #                 Both scale ×3 for objects with ≥3 sightings
+        #                 (repetition protects). Set None on a profile to
+        #                 make objects immortal (archival).
+        #
+        # Load-bearing TTL renewal (spaced-repetition for entities):
+        #   renew_ratio — fraction of the elapsed interval added to an
+        #                 object's survival clock when it is found still
+        #                 load-bearing at prune time. Interval-based (Anki-
+        #                 style): each renewal extends the interval by
+        #                 renew_ratio × (now − anchor). 0.0 disables.
+        #   renew_max   — absolute cap on last_renewal_tau, so an eternally-
+        #                 mentioned entity cannot become de-facto immortal.
+        #   How it works: when an object WOULD be forgotten (dtau ≥
+        #     obj_forget), prune first asks "is it still load-bearing?" —
+        #     named in a consolidation episode since the last prune, OR
+        #     re-sighted ≥2 times in real episodes since the last prune.
+        #     If yes → extend its clock (last_renewal_tau) instead of
+        #     forgetting. If no → forget on schedule. Retention is re-earned
+        #     each cycle: when the entity stops being mentioned (e.g. a
+        #     deployment target we've finished using), the check fails and it
+        #     decays naturally. Cost asymmetry: retaining is one row in
+        #     SQLite; losing is a full re-derivation.
+        #
+        # Per-profile defaults:
+        #   balanced   — human-ish: episodes fade on a workday scale.
+        #   archival   — photographic: episodes + objects immortal (None
+        #                disables pruning and renewal entirely).
+        #   long_term  — clerk: documents linger well past usefulness;
+        #                objects survive long horizons with 30% renewal.
+        #   short_term — NPC/immersive: fast fade is the feature; renewal
+        #                disabled so nothing lingers.
+        #
+        # Tuning guidance (the two dials that matter):
+        #   - τ burn rate under agentic load is ~0.9 τ/event when predictions
+        #     are empty. A profile's S_* and obj_* numbers are denominated in
+        #     τ, NOT wall-clock — a busy session can burn 13k τ/day. Size
+        #     horizons for the workload, or the entity layer will flush in a
+        #     day (the exact failure long_horizon work hits).
+        #   - Long-horizon projects: prefer obj_forget large + renew_ratio
+        #     > 0 over wall-clock decay, which penalizes age, not importance.
         self.retention_profiles = {
             "balanced":   {"S_base": 30.0,  "S_arousal": 40.0,
                            "prune_merge": 0.35, "prune_expire": 0.05,
-                           "obj_dormant": 200.0, "obj_forget": 1200.0},
+                           "obj_dormant": 200.0, "obj_forget": 1200.0,
+                           "renew_ratio": 0.3, "renew_max": 12000.0},
             "archival":   {"S_base": 1e6,   "S_arousal": 0.0,
                            "prune_merge": None, "prune_expire": None,
-                           "obj_dormant": None, "obj_forget": None},
+                           "obj_dormant": None, "obj_forget": None,
+                           "renew_ratio": None, "renew_max": None},
             "long_term":  {"S_base": 120.0, "S_arousal": 40.0,
                            "prune_merge": 0.20, "prune_expire": 0.02,
-                           "obj_dormant": 600.0, "obj_forget": 5000.0},
+                           "obj_dormant": 600.0, "obj_forget": 5000.0,
+                           "renew_ratio": 0.3, "renew_max": 50000.0},
             "short_term": {"S_base": 6.0,   "S_arousal": 4.0,
                            "prune_merge": 0.20, "prune_expire": 0.02,
-                           "obj_dormant": 25.0, "obj_forget": 150.0},
+                           "obj_dormant": 25.0, "obj_forget": 150.0,
+                           "renew_ratio": 0.0, "renew_max": 150.0},
         }
         self.vec_index = FlatVectorIndex()
         for eid, vec in store.iter_embeddings():
@@ -603,8 +667,10 @@ class MemoryEngine:
         # supported). Repetition protects: >=3 sightings earn 3x horizons.
         rep["objects_dormant"] = 0
         rep["objects_forgotten"] = 0
+        rep["objects_renewed"] = 0
         dom_rows = self.store.conn.execute(
-            "SELECT o.id, o.status, o.domain_id, "
+            "SELECT o.id, o.status, o.domain_id, o.canonical_name, "
+            "o.first_seen_tau fst, o.last_renewal_tau ren, "
             "COALESCE(o.last_seen_tau, o.first_seen_tau) lst, "
             "COALESCE(s.sightings,0) sx FROM object o LEFT JOIN "
             "(SELECT object_id, COUNT(*) sightings FROM object_sighting "
@@ -634,13 +700,80 @@ class MemoryEngine:
             mult = 3.0 if r["sx"] >= 3 else 1.0
             if dtau >= of_ * mult and (
                     r["status"] != "stable" or of_ * mult >= 75 * mult):
-                self.store.set_object_status(str(r["id"]), "forgotten")
-                rep["objects_forgotten"] += 1
+                # load-bearing check: if the entity is still named in recent
+                # consolidations (or heavily re-sighted since the last prune),
+                # extend its TTL instead of forgetting it (spaced-repetition
+                # renewal — retention re-earned each cycle, never permanent).
+                if self._renew_load_bearing(dom_cache, d_id, r, now_cache):
+                    rep["objects_renewed"] += 1
+                else:
+                    self.store.set_object_status(str(r["id"]), "forgotten")
+                    rep["objects_forgotten"] += 1
             elif dtau >= od * mult and r["status"] not in ("stable", "dormant"):
                 self.store.set_object_status(str(r["id"]), "dormant")
                 rep["objects_dormant"] += 1
 
+        # advance the prune boundary: consolidations/sightings written before
+        # this pass are "old" — load-bearing is re-earned strictly each cycle.
+        if now_cache:
+            latest = max(now_cache.values())
+            self.store.conn.execute(
+                "INSERT INTO meta(k,v) VALUES('prune_boundary', ?) "
+                "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (str(latest),))
+            self.store._commit()
+
         return PruneReport(**rep)
+
+    def _renew_load_bearing(self, dom_cache: dict, d_id: int,
+                            r: sqlite3.Row, now_cache: dict) -> bool:
+        """Extend an object's TTL if it is still load-bearing.
+
+        Load-bearing evidence (deterministic, no LLM at prune time):
+          1. named in a consolidation episode written since the last prune, OR
+          2. re-sighted >=2 times in real episodes since the last prune.
+        On renewal the survival clock advances by renew_ratio x (now - anchor),
+        capped at renew_max (absolute, so an eternally-mentioned entity cannot
+        become de-facto immortal). Returns True if renewed (object survives).
+        """
+        P = dom_cache[d_id]
+        rr, rmax = P.get("renew_ratio", 0.0), P.get("renew_max")
+        if rr is None or rr <= 0.0 or rmax is None:
+            return False                        # renewal disabled for profile
+        now = now_cache[d_id]
+        name = r["canonical_name"]
+        # window anchor: consolidations/sightings counted only since the
+        # last prune boundary (strictly re-earned each cycle).
+        last_prune = float(self.store.conn.execute(
+            "SELECT COALESCE(MAX(v), 0.0) FROM meta "
+            "WHERE k='prune_boundary'").fetchone()[0] or 0.0)
+        if not name:
+            return False
+        # 1) consolidation mentions since last prune
+        hit = self.store.conn.execute(
+            "SELECT COUNT(*) c FROM episode e "
+            "WHERE e.kind='consolidation' AND e.tau > ? AND "
+            "e.features_json LIKE ? ESCAPE '\\'",
+            (last_prune, f"%{name}%")).fetchone()["c"]
+        # 2) re-sightings in real episodes since last prune
+        if hit == 0:
+            sx = self.store.conn.execute(
+                "SELECT COUNT(*) c FROM episode e "
+                "JOIN object_sighting os ON os.episode_id = e.id "
+                "WHERE os.object_id = ? AND e.tau > ? AND "
+                "e.kind != 'consolidation'",
+                (str(r["id"]), last_prune)).fetchone()["c"]
+            if sx < 2:
+                return False
+        # renewal: advance the survival clock (SRS interval growth)
+        anchor = float(r["ren"] or r["fst"] or r["lst"] or 0.0)
+        extend = rr * (now - anchor)
+        new_anchor = min(anchor + extend, float(rmax))
+        self.store.conn.execute(
+            "UPDATE object SET last_renewal_tau=? WHERE id=?",
+            (new_anchor, str(r["id"])))
+        self.store._commit()
+        return True
 
 
 def actual_key_val_ok(actual, expected) -> bool:

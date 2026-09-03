@@ -189,6 +189,7 @@ CREATE TABLE IF NOT EXISTS object (
   last_seen_tau REAL,
   salience REAL DEFAULT 0.5,
   status TEXT DEFAULT 'forming',    -- forming | stable | dormant
+  last_renewal_tau REAL,            -- H-spec: last load-bearing renewal (TTL)
   -- multi-axial classification (borrowed: SUMO split + Wikidata multi-axis)
   class_materiality TEXT,           -- physical | abstract
   class_animacy     TEXT,           -- living | non-living (null if abstract)
@@ -275,7 +276,8 @@ class SQLiteStore:
                           ("class_animacy", "TEXT"),
                           ("class_origin", "TEXT"),
                           ("basic_level_name", "TEXT"),
-                          ("last_seen_tau", "REAL")):
+                          ("last_seen_tau", "REAL"),
+                          ("last_renewal_tau", "REAL")):
             if col not in ocols:
                 self.conn.execute(f"ALTER TABLE object ADD COLUMN {col} {decl}")
         if "body_embed" not in cols:
@@ -602,7 +604,7 @@ class SQLiteStore:
                 rows = self.conn.execute(
                     "SELECT id FROM episode_fts WHERE episode_fts MATCH ? "
                     "ORDER BY rank LIMIT ?", (query, k)).fetchall()
-        except Exception:
+        except sqlite3.Error:
             return []
         return [r["id"] for r in rows]
 

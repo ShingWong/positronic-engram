@@ -134,3 +134,4 @@ class PruneReport:
     residues: int = 0
     objects_dormant: int = 0
     objects_forgotten: int = 0
+    objects_renewed: int = 0

@@ -27,7 +27,6 @@ Same brain, different retention policies:
 import uuid
 
 import pytest
-
 from memeng.engine import MemoryEngine
 from memeng.models import Event, Tier
 from memeng.store import SQLiteStore
@@ -128,7 +127,7 @@ def test_strength_reflects_profile():
     assert all(math.isinf(v) is False for v in strengths.values())
 
 
-import math  # noqa: E402
+import math
 
 
 # unknown profile rejected loudly
@@ -144,8 +143,7 @@ def test_object_ladder_short_term():
     e.attach_stream("mail:p1", "mail")
     did = s.get_stream("mail:p1")["domain_id"]
     # well-sighted object (protected multiplier) vs singleton
-    import uuid as _u
-    from memeng.models import EpisodeRecord, Provenance
+    from memeng.models import Provenance
     wall = datetime(2026, 1, 1, tzinfo=timezone.utc)
     for name in ("recurring thing", "one-off thing"):
         oid = e.store.upsert_object(domain_id=did, kind="thread",
@@ -195,5 +193,81 @@ def test_archival_objects_immortal():
     assert s.get_object(oid)["status"] == "forming"     # untouched
 
 
-import uuid  # noqa: E402
-from datetime import datetime, timedelta, timezone  # noqa: E402
+from datetime import datetime, timedelta, timezone
+
+
+# ── load-bearing TTL renewal (retention re-earned each cycle) ─────────────
+def _upsert_entity(e, did, name, first_tau, last_tau, status="forming"):
+    from datetime import datetime, timezone
+
+    from memeng.models import EpisodeRecord as ER
+    from memeng.store import Provenance
+    oid = e.store.upsert_object(domain_id=did, kind="entity",
+        canonical_name=name, visual_phash=None,
+        wall=datetime(2026,1,1,tzinfo=timezone.utc), tau=first_tau)
+    for i, tau in enumerate((first_tau, last_tau)):
+        er = ER(id=uuid.uuid4(), stream="mail:p1", kind="message",
+                wall=datetime(2026,1,1,tzinfo=timezone.utc) + timedelta(days=i),
+                mono=10+i, tau=float(tau), persons=[], subject_norm=None,
+                salience=0.5, tier=Tier.NORMAL, strength=30.0,
+                provenance=Provenance.WITNESSED, fuzz_lo=None,
+                fuzz_hi=None, precision_src="exact", is_anchor=False,
+                features={})
+        e.store.insert_episode(er, 1)
+        e.store.link_sighting(str(er.id), oid, "textual")
+    e.store.conn.execute("UPDATE object SET last_seen_tau=? WHERE id=?",
+                         (last_tau, oid)); e.store._commit()
+    return oid
+
+
+def _write_consolidation(e, text, tau):
+    from datetime import datetime, timezone
+
+    from memeng.models import EpisodeRecord as ER
+    from memeng.store import Provenance
+    er = ER(id=uuid.uuid4(), stream="mail:p1", kind="consolidation",
+            wall=datetime(2026,1,1,tzinfo=timezone.utc), mono=50, tau=float(tau),
+            persons=[], subject_norm=text[:80], salience=0.8,
+            tier=Tier.NORMAL, strength=120.0,
+            provenance=Provenance.WITNESSED, fuzz_lo=None, fuzz_hi=None,
+            precision_src="exact", is_anchor=False,
+            features={"subject_norm": text[:80], "body_text": text})
+    e.store.insert_episode(er, 1)
+
+
+def test_load_bearing_object_survives_prune_while_consolidated():
+    e, s = mk("long_term")
+    e.attach_stream("mail:p1", "mail")
+    did = s.get_stream("mail:p1")["domain_id"]
+    oid = _upsert_entity(e, did, "web2", first_tau=0.0, last_tau=0.0)
+    _write_consolidation(e, "web2 deployment target for tests", tau=4900.0)
+    rep = e.prune(tau_now=10_000.0)          # Δτ=10000 ≫ 5000 → would forget
+    assert s.get_object(oid)["status"] != "forgotten", rep
+    assert s.get_object(oid)["last_renewal_tau"] > 0.0
+
+
+def test_load_bearing_object_forgotten_once_consolidation_stops():
+    e, s = mk("long_term")
+    e.attach_stream("mail:p1", "mail")
+    did = s.get_stream("mail:p1")["domain_id"]
+    oid = _upsert_entity(e, did, "web2", first_tau=0.0, last_tau=0.0)
+    _write_consolidation(e, "web2 deployment target for tests", tau=4900.0)
+    e.prune(tau_now=10_000.0)                # renewed here (load-bearing)
+    assert s.get_object(oid)["status"] != "forgotten"
+    rep = e.prune(tau_now=20_000.0)          # no new consolidation → decay
+    assert s.get_object(oid)["status"] == "forgotten", rep
+
+
+def test_renewal_respects_cap():
+    e, s = mk("long_term")
+    e.attach_stream("mail:p1", "mail")
+    did = s.get_stream("mail:p1")["domain_id"]
+    oid = _upsert_entity(e, did, "web2", first_tau=0.0, last_tau=0.0)
+    for tau in (4900, 15000, 25000, 40000):
+        _write_consolidation(e, "web2 deployment target for tests", tau)
+        e.prune(tau_now=tau)
+    st = s.get_object(oid)
+    cap = e.retention_profiles["long_term"].get(
+        "renew_max", 10.0 * e.retention_profiles["long_term"]["obj_forget"])
+    assert st["status"] != "forgotten"
+    assert st["last_renewal_tau"] <= cap

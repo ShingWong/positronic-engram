@@ -20,6 +20,7 @@ Not a vector store wrapper. Not a summarization window. A cognitive loop: **pred
 - [Why a memory engine?](#why-a-memory-engine)
 - [Polytemporal retention — every event carries a time vector](#polytemporal-retention--every-event-carries-a-time-vector)
 - [Retention profiles — pick a curve](#retention-profiles--pick-a-curve)
+- [Retention profile knobs — tuning reference](#retention-profile-knobs--tuning-reference)
 - [Logical time τ](#logical-time-τ)
 - [Tensor-grounded objects — why recall is cheap](#tensor-grounded-objects--why-recall-is-cheap)
 - [How fast is it?](#how-fast-is-it)
@@ -78,6 +79,46 @@ Same 55 messages, 78 weeks, four policies (`engine.py:48`):
 > **Demotion, not deletion.** Episodes below 0.35 drop to `day_token`; below 0.05 to `week_token` — they are never deleted (`expired` stays 0). The `@Week 78` column counts only `level="event"` episodes remaining after `prune()`.
 
 `balanced` is the everyday default. `archival` never forgets — it grows forever, so it's gated behind a confirm. Pruning follows a weekly ladder: `0.35 → day_token 0.05 → expired` (`engine.py:443`).
+
+---
+
+## Retention profile knobs — tuning reference
+
+Every knob resolves per-domain (via `register_domain(..., retention_profile=...)`), so one brain can mix policies. The authoritative copy of this reference lives in the source docstring at `engine.py:71`; this section is the project-facing version for agents and contributors.
+
+### Episode decay — the verbatim event log
+
+| Knob | Meaning | Units |
+|---|---|---|
+| `S_base` | baseline strength an episode is born with | τ |
+| `S_arousal` | strength added per unit of event arousal (`strength = S_base + S_arousal × arousal`) | τ/arousal |
+| `prune_merge` | retain threshold below which an episode demotes to `day_token` | probability |
+| `prune_expire` | retain threshold below which an episode expires → residue written | probability |
+
+Retention per episode is `exp(−Δτ/strength)`, so `S_base` is effectively the half-life in τ. Episodes demote, never delete: below `prune_merge` the subject is stripped (FTS kept); below `prune_expire` a residue is written.
+
+### Object (entity) decay — the IP layer
+
+| Knob | Meaning | Units |
+|---|---|---|
+| `obj_dormant` | τ of no sightings before an entity goes dormant | τ |
+| `obj_forget` | τ of no sightings before an entity is forgotten | τ |
+
+Both scale **×3** for entities with ≥3 sightings (repetition protects). Set `None` to make entities immortal (`archival`).
+
+### Load-bearing TTL renewal — spaced repetition for entities
+
+| Knob | Meaning | Units |
+|---|---|---|
+| `renew_ratio` | fraction of the elapsed interval added to an entity's survival clock when it is found still load-bearing at prune time | τ/τ |
+| `renew_max` | absolute cap on `last_renewal_tau` — an eternally-mentioned entity cannot become de-facto immortal | τ |
+
+The mechanism: when an entity **would** be forgotten (`Δτ ≥ obj_forget`), prune first asks *"is it still load-bearing?"* — named in a **consolidation** episode since the last prune, **or** re-sighted ≥2 times in real episodes since the last prune. If yes, its clock extends by `renew_ratio × (now − anchor)` (interval-based, Anki-style) instead of forgetting; if no, it decays on schedule. Retention is **re-earned each cycle** — the moment an entity stops being load-bearing (e.g. a deployment target you've finished using), the check fails and it fades naturally. The asymmetry that motivates this: retaining is one row in SQLite; losing is a full re-derivation.
+
+### Tuning guidance — the two dials that matter
+
+- **τ burns fast under agentic load.** When predictions are empty, novelty is 0.9, so a busy session advances τ at ~0.9 per event — up to ~13k τ/day. Profile numbers are denominated in **τ, not wall-clock**. Size horizons for the workload, or the entity layer flushes within a day — the exact failure long-horizon agentic work hits.
+- **For long-horizon projects**, prefer large `obj_forget` + `renew_ratio > 0` over wall-clock decay. Wall-clock penalizes *age*, not *importance*; a load-bearing entity from month 1 of a multi-month project gets flushed at month 6 regardless of how much it still matters. `renew_ratio` lets the agent's own consolidation summaries keep it alive while it matters, and drop it when it doesn't.
 
 ---
 

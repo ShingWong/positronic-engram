@@ -20,7 +20,6 @@
 import uuid
 
 import pytest
-
 from memeng.engine import MemoryEngine
 from memeng.fuzzy import FlatVectorIndex, rrf_fuse
 from memeng.models import EpisodeRecord, Provenance, Tier
