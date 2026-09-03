@@ -95,7 +95,11 @@ class MemoryEngine:
         #                 (repetition protects). Set None on a profile to
         #                 make objects immortal (archival).
         #
-        # Load-bearing TTL renewal (spaced-repetition for entities):
+        # Load-bearing TTL renewal (spaced repetition for entities — after
+        # Ebbinghaus, retention is proportional to demonstrated reliability;
+        # after Rescorla & Wagner, the update is proportional to the
+        # discrepancy — here, to the elapsed interval since last renewal.
+        # Re-earned each cycle rather than granted once):
         #   renew_ratio — fraction of the elapsed interval added to an
         #                 object's survival clock when it is found still
         #                 load-bearing at prune time. Interval-based (Anki-
@@ -702,8 +706,9 @@ class MemoryEngine:
                     r["status"] != "stable" or of_ * mult >= 75 * mult):
                 # load-bearing check: if the entity is still named in recent
                 # consolidations (or heavily re-sighted since the last prune),
-                # extend its TTL instead of forgetting it (spaced-repetition
-                # renewal — retention re-earned each cycle, never permanent).
+                # extend its TTL instead of forgetting it (spaced repetition,
+                # after Ebbinghaus + Rescorla-Wagner — retention re-earned
+                # each cycle, never permanent).
                 if self._renew_load_bearing(dom_cache, d_id, r, now_cache):
                     rep["objects_renewed"] += 1
                 else:

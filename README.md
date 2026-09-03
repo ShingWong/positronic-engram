@@ -108,12 +108,19 @@ Both scale **×3** for entities with ≥3 sightings (repetition protects). Set `
 
 ### Load-bearing TTL renewal — spaced repetition for entities
 
+> The mechanism is the **Ebbinghaus forgetting curve** (the principle behind
+> Anki and every spaced-repetition system): retention is proportional to
+> demonstrated reliability, re-earned each cycle rather than granted once.
+> The renewal update itself is the **Rescorla–Wagner** (1972) learning law:
+> the association's strength adjusts proportionally to the discrepancy — here,
+> the elapsed interval since the last renewal.
+
 | Knob | Meaning | Units |
 |---|---|---|
 | `renew_ratio` | fraction of the elapsed interval added to an entity's survival clock when it is found still load-bearing at prune time | τ/τ |
 | `renew_max` | absolute cap on `last_renewal_tau` — an eternally-mentioned entity cannot become de-facto immortal | τ |
 
-The mechanism: when an entity **would** be forgotten (`Δτ ≥ obj_forget`), prune first asks *"is it still load-bearing?"* — named in a **consolidation** episode since the last prune, **or** re-sighted ≥2 times in real episodes since the last prune. If yes, its clock extends by `renew_ratio × (now − anchor)` (interval-based, Anki-style) instead of forgetting; if no, it decays on schedule. Retention is **re-earned each cycle** — the moment an entity stops being load-bearing (e.g. a deployment target you've finished using), the check fails and it fades naturally. The asymmetry that motivates this: retaining is one row in SQLite; losing is a full re-derivation.
+The mechanism: when an entity **would** be forgotten (`Δτ ≥ obj_forget`), prune first asks *"is it still load-bearing?"* — named in a **consolidation** episode since the last prune, **or** re-sighted ≥2 times in real episodes since the last prune. If yes, its clock extends by `renew_ratio × (now − anchor)` (interval-based; the proportional update is the Rescorla–Wagner law) instead of forgetting; if no, it decays on schedule. Retention is **re-earned each cycle** — the moment an entity stops being load-bearing (e.g. a deployment target you've finished using), the check fails and it fades naturally. The asymmetry that motivates this: retaining is one row in SQLite; losing is a full re-derivation.
 
 ### Tuning guidance — the two dials that matter
 
