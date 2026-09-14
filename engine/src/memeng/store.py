@@ -554,6 +554,21 @@ class SQLiteStore:
             (episode_id, text))
         self._commit()
 
+    def delete_episode(self, episode_id: str) -> bool:
+        """Delete one episode + its FTS row + sightings, one commit.
+
+        Returns True when a row existed. (Prune never deletes — it only
+        re-levels — so this is the single delete path.)
+        """
+        cur = self.conn.execute("DELETE FROM episode WHERE id=?",
+                                (episode_id,))
+        self.conn.execute("DELETE FROM episode_fts WHERE id=?",
+                          (episode_id,))
+        self.conn.execute(
+            "DELETE FROM object_sighting WHERE episode_id=?", (episode_id,))
+        self._commit()
+        return cur.rowcount > 0
+
     def recent_candidates(self, k: int = 24,
                           stream: str | None = None) -> list[str]:
         """Recent non-empty episodes for the recency channel (indexed)."""
