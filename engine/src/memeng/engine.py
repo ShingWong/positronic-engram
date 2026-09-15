@@ -535,7 +535,10 @@ class MemoryEngine:
                     "salience": ep.salience if ep else None,
                     "kind": ep.kind if ep else None,
                     "person_boost": pboost,
-                    "fallback": fallback})
+                    "fallback": fallback,
+                    "message_id": feats.get("message_id") or "",
+                    "sender": feats.get("sender") or "",
+                    "threat_tag": feats.get("threat_tag") or "clean"})
             out.sort(key=lambda d: -d["rrf_score"])
             if consolidation == "only":
                 out = [d for d in out if d["kind"] == "consolidation"][:k]
