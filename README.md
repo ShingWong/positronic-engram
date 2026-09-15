@@ -63,6 +63,11 @@ Most systems stamp an event with one timestamp and call it done.
 
 Decay doesn't run on wall-clock. It runs on **Δτ** — the subjective distance. That's what makes retention a *curve*, not a TTL counter.
 
+Every brain db carries version flags in its `meta` table:
+`schema_version` (table layout, currently 2) and `brain_version`
+(brain format, starts at 1). Old brains gain them automatically on
+open via the store migration path.
+
 ---
 
 ## Retention profiles — pick a curve

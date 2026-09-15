@@ -32,10 +32,12 @@ from datetime import datetime, timezone
 from .models import EpisodeRecord, Provenance, Tier
 
 SCHEMA_VERSION = 2
+BRAIN_VERSION = 1
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 INSERT OR IGNORE INTO meta(k,v) VALUES('schema_version','2');
+INSERT OR IGNORE INTO meta(k,v) VALUES('brain_version','1');
 
 CREATE TABLE IF NOT EXISTS lu_kind (
   id INTEGER PRIMARY KEY, name TEXT UNIQUE);
@@ -266,6 +268,8 @@ class SQLiteStore:
 
     def _migrate(self) -> None:
         """Lightweight additive migrations for pre-existing databases."""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO meta(k,v) VALUES('brain_version','1')")
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(episode)")}
         ocols = {r[1] for r in self.conn.execute("PRAGMA table_info(object)")}
         dcols = {r[1] for r in self.conn.execute("PRAGMA table_info(domain)")}
