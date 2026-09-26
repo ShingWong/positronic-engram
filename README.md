@@ -2,7 +2,7 @@
 
 ### Deterministic, auditable, tensor-grounded memory for LLM agents
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![SQLite Powered](https://img.shields.io/badge/Storage-SQLite-lightgrey)]()
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)]()
 [![Recall](https://img.shields.io/badge/Recall-0.7ms%20store%20%E2%80%94%20real%20%CE%940.44-brightgreen)]()
@@ -261,4 +261,4 @@ python3 -m pytest ../consumers/benchmarks/tests/test_synthetic_e7.py -q
 
 ## License
 
-GPL-3.0-or-later — see `LICENSE`.
+AGPL-3.0-or-later OR Commercial — see `LICENSE`.
