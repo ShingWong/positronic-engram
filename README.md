@@ -261,4 +261,4 @@ python3 -m pytest ../consumers/benchmarks/tests/test_synthetic_e7.py -q
 
 ## License
 
-AGPL-3.0-or-later OR Commercial — see `LICENSE`.
+AGPL-3.0-or-later OR LicenseRef-Commercial — see `LICENSE`.
