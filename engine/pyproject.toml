@@ -4,11 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memeng"
-version = "0.2.0"
+version = "0.2.1"
 description = "Fuzzy memory engine v0 — cognitive loop over polytemporal episodes"
 requires-python = ">=3.10"
 license = { text = "AGPL-3.0-or-later OR LicenseRef-Commercial" }
 authors = [{ name = "Shing Wong" }]
+# numpy is a hard requirement of the semantic channel, not an optional extra.
+# fuzzy.FlatIndex.search() imports it unguarded and returns [] when the matrix
+# is None, so a missing numpy silently disables vector recall instead of
+# failing loudly. Declared here so a clean install actually works.
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "ruff"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
