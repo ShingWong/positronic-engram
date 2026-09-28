@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.egg-info/
+# setuptools leaves engine/build/ behind on `pip install ./engine`
+build/
+dist/
