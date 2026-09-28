@@ -1,0 +1,19 @@
+name: ci
+on: { push: { branches: [main] }, pull_request: {} }
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      # numpy is a declared runtime dependency of memeng. Without it
+      # fuzzy.FlatIndex.search() returns [] and the semantic recall channel
+      # degrades silently rather than failing.
+      - run: pip install -e "engine[test]"
+      - run: python -m pytest engine/tests/ -q
+      # Lint covers the library only. engine/tests/ currently carries 16
+      # pre-existing findings (unused locals in test_engine/test_fuzzy/
+      # test_profiles/test_vision) which are tracked as cleanup, not enforced
+      # here — turning them on today would make this job red on arrival.
+      - run: ruff check engine/src/memeng/
