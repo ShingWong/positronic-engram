@@ -23,17 +23,30 @@
 # =====================================================================
 
 """Bridge-level tests: kairos_brain.ask() against a temp store."""
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
-for p in (HERE, Path("/usr/local/devel/positronic/positronic-private")):
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
 sys.path.insert(0, str(HERE / "engine" / "src"))
 
-import kairos_brain as kb
+# kairos_brain lives in positronic-private, which is deliberately not a
+# dependency of this public repo: it holds PII and is behind a gitignore
+# firewall. So there is no default location to fall back on -- a path baked in
+# here would only ever work on the machine that wrote it, and would name that
+# machine's layout. Point POSITRONIC_PRIVATE_DIR at the checkout, the same
+# variable name consumers/benchmarks/harness/paths.py already uses.
+_PRIVATE = os.environ.get("POSITRONIC_PRIVATE_DIR", "").strip()
+if _PRIVATE and Path(_PRIVATE).is_dir() and _PRIVATE not in sys.path:
+    sys.path.insert(0, _PRIVATE)
+
+import pytest
+
+kb = pytest.importorskip(
+    "kairos_brain",
+    reason="needs positronic-private; set POSITRONIC_PRIVATE_DIR to its checkout",
+)
 from memeng.models import Event
 
 
