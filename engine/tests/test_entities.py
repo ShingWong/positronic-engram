@@ -213,3 +213,121 @@ def test_prune_objects_use_per_domain_now_not_global():
         "SELECT status FROM object WHERE id=?", (quiet_obj,)).fetchone()["status"]
     assert quiet_status not in ("dormant", "forgotten")
     assert rep.objects_forgotten == 0
+
+
+# E2 ablation — object layer: the wall arm, the renewal skip, and the wall_base
+# fallback. Before the object-axis branch these all fail: decay_axis gated only
+# the episode ladder, so objects aged on tau whatever the axis said.
+def _aged_object(s, *, tau, wall, name):
+    """One object, aged by fiat: last_seen_* set to (tau, wall)."""
+    oid = s.get_or_create_object(
+        domain_id=1, kind="entity", canonical_name=name,
+        wall=wall, tau=tau)
+    s.conn.execute(
+        "UPDATE object SET first_seen_tau=?, last_seen_tau=?, "
+        "first_seen_wall=?, last_seen_wall=? WHERE id=?",
+        (tau, tau, wall.isoformat(), wall.isoformat(), oid))
+    return oid
+
+
+# balanced's object ladder: obj_dormant=200, obj_forget=1200 (tau units). The
+# wall arm compares DAYS against the same numbers, so a gap past 1200 days is
+# needed to reach "forgotten" rather than merely "dormant".
+_WALL_ANCIENT = datetime(2026, 1, 1, tzinfo=timezone.utc)
+_WALL_FAR_FUTURE = datetime(2031, 1, 1, tzinfo=timezone.utc)   # ~1826 days
+
+
+def test_prune_wall_axis_without_wall_now_does_not_raise():
+    # Regression: wall is stored as ISO TEXT, so MAX(wall) is a string and
+    # (wall_base - ep.wall.timestamp()) raised TypeError. The E1 driver always
+    # passed wall_now explicitly, which is why this stayed hidden.
+    e, _s = mk()
+    e.new_event(_sess_event("deploy", "shipped"))
+    e.prune(decay_axis="wall")
+
+
+def test_prune_wall_axis_falls_back_to_max_wall():
+    e, _s = mk()
+    now = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+    e.new_event(Event(stream="kairos:sessions", kind="message", wall=now,
+                      features={"subject_norm": "x", "arousal": 0.9}, persons=[]))
+    rep = e.prune(decay_axis="wall")
+    assert rep.scanned >= 1
+
+
+def test_object_wall_axis_ages_by_wall_not_tau():
+    # An object whose wall clock is ancient but whose tau is recent: recent in
+    # experience, ancient in calendar time. The wall arm must forget it; the
+    # tau arm must keep it. This is the whole point of the comparison.
+    for axis, expect_forgotten in (("tau", False), ("wall", True)):
+        e, s = mk()
+        oid = _aged_object(s, tau=1400.0, wall=_WALL_ANCIENT,
+                           name=f"thing-{axis}")
+        s.conn.execute("UPDATE stream SET tau=1500.0, mono=500 WHERE stream=?",
+                       ("kairos:sessions",))
+        rep = e.prune(tau_now=1500.0, decay_axis=axis,
+                      wall_now=_WALL_FAR_FUTURE.timestamp())
+        status = s.conn.execute(
+            "SELECT status FROM object WHERE id=?", (oid,)).fetchone()["status"]
+        if expect_forgotten:
+            assert status == "forgotten", \
+                f"{axis} arm must forget a calendar-ancient object, got {status}"
+            assert rep.objects_forgotten >= 1
+        else:
+            assert status not in ("dormant", "forgotten"), \
+                f"{axis} arm must not age a recently-experienced object, got {status}"
+
+
+def test_object_wall_axis_never_renews():
+    # Renewal is a tau mechanism (interval in tau units). A wall arm that renewed
+    # would no longer be a plain timestamp index, which is the control we need.
+    #
+    # Order matters: the tau axis is asserted FIRST, while renewal is still
+    # enabled. Without that the test would pass vacuously on today's engine,
+    # where the wall arm ignores objects altogether and therefore never renews
+    # anything. Asserting tau-renews-then-wall-does-not pins both halves of the
+    # contrast, so a regression that made the wall arm renew would still fail.
+    def _prepare():
+        e, s = mk()
+        P = e.retention_profiles["balanced"]
+        assert P.get("renew_ratio", 0.0) > 0.0, \
+            "precondition: the balanced profile must have renewal enabled"
+        # Load-bearing evidence path 2 needs >=2 REAL non-consolidation episodes
+        # sighting the object since the last prune, so the episodes have to
+        # actually exist. Ingesting events that mention the entity produces both
+        # the episodes and the sightings, via entity extraction.
+        for i in range(2):
+            e.new_event(_sess_event(
+                f"mention {i}", "shipped persona-bot-v2 to web2 again"))
+        oid = s.conn.execute(
+            "SELECT id FROM object WHERE canonical_name='web2'").fetchone()["id"]
+        sx = s.conn.execute(
+            "SELECT COUNT(*) c FROM object_sighting WHERE object_id=?",
+            (oid,)).fetchone()["c"]
+        assert sx >= 2, f"precondition: need >=2 real sightings, got {sx}"
+        # now age it: ancient in calendar time, ancient in tau as well, so the
+        # object is a forget candidate and only renewal can save it
+        s.conn.execute(
+            "UPDATE object SET first_seen_tau=0, last_seen_tau=0, "
+            "first_seen_wall=?, last_seen_wall=? WHERE id=?",
+            (_WALL_ANCIENT.isoformat(), _WALL_ANCIENT.isoformat(), oid))
+        s.conn.execute("UPDATE stream SET tau=9000.0, mono=500 WHERE stream=?",
+                       ("kairos:sessions",))
+        return e, s, oid
+
+    far_future = _WALL_FAR_FUTURE.timestamp()
+
+    # (a) tau axis, renewal ENABLED: the same object is load-bearing and renewed.
+    e, s, oid = _prepare()
+    rep = e.prune(tau_now=9000.0, decay_axis="tau")
+    assert rep.objects_renewed >= 1, \
+        "precondition: the tau arm must renew a load-bearing object"
+    assert rep.objects_forgotten == 0
+
+    # (b) wall axis: renewal is skipped, so the same object is forgotten.
+    e, s, oid = _prepare()
+    rep = e.prune(tau_now=9000.0, decay_axis="wall", wall_now=far_future)
+    assert rep.objects_renewed == 0, "the wall arm must not renew"
+    status = s.conn.execute(
+        "SELECT status FROM object WHERE id=?", (oid,)).fetchone()["status"]
+    assert status == "forgotten"

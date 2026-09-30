@@ -530,11 +530,15 @@ class MemoryEngine:
                            for i, x in enumerate(ch) if x == eid)
                 feats = ep.features if ep else {}
                 bt = feats.get("body_text") or ""
+                # Attachment extraction text is dense — line items live
+                # past the chat window, so attachment hits carry the wider
+                # slice; mail keeps 200 chars for small-model budgets.
+                snip_n = 2000 if (ep.kind if ep else None) == "attachment" else 200
                 out.append({
                     "episode_id": eid,
                     "rrf_score": round(base * pboost, 4),
                     "subject": ep.subject_norm if ep else "?",
-                    "snippet": bt[:200],
+                    "snippet": bt[:snip_n],
                     "wall": ep.wall.isoformat() if ep else None,
                     "tau": ep.tau if ep else None,
                     "stream": ep.stream if ep else None,
@@ -609,11 +613,19 @@ class MemoryEngine:
         """Selective pruning. domain='kairos' scopes the pass to one domain —
         the foundation for per-origin memory hygiene.
 
-        decay_axis selects the clock driving the decay ladder (E1 ablation):
+        decay_axis selects the clock driving BOTH decay ladders (E1/E2 ablations):
         - "tau"  (default): R = exp(-(tau_now - tau)/S), the polytemporal axis
         - "wall" (MemoryBank-style R = exp(-age/S)): age is wall-clock age in
           DAYS (so S reads in days, matching the tau profile's scale).
           wall_now is a unix timestamp (seconds).
+
+        The axis applies to the episode ladder AND the object layer. On the wall
+        axis the object layer is a plain timestamp index: it ages objects by
+        last_seen_wall and skips TTL renewal, because renewal extends a tau
+        interval and has no wall-clock analogue. Callers running the wall arm are
+        expected to re-denominate obj_dormant/obj_forget in days, the same way
+        they re-denominate S_base; otherwise the arms differ in units as well as
+        in clock. See consumers/benchmarks/suites/decay_ablation.
         """
         rep = {"scanned": 0, "day_merged": 0, "week_merged": 0,
                "expired": 0, "residues": 0}
@@ -625,10 +637,7 @@ class MemoryEngine:
         # E1 ablation: decay axis selects the clock. tau-axis uses the
         # polytemporal accumulator; wall-axis uses wall-clock age (unix sec).
         wall_axis = decay_axis == "wall"
-        wall_base = wall_now if wall_now is not None else \
-            (self.store.conn.execute(
-                "SELECT COALESCE(MAX(wall),0) w FROM episode"
-            ).fetchone()["w"])
+        wall_base = self._wall_base(wall_now)
         dom_cache: dict[int, dict] = {}
         for ep in eps:
             if wall_axis:
@@ -685,6 +694,7 @@ class MemoryEngine:
             "SELECT o.id, o.status, o.domain_id, o.canonical_name, "
             "o.first_seen_tau fst, o.last_renewal_tau ren, "
             "COALESCE(o.last_seen_tau, o.first_seen_tau) lst, "
+            "COALESCE(o.last_seen_wall, o.first_seen_wall) lsw, "
             "COALESCE(s.sightings,0) sx FROM object o LEFT JOIN "
             "(SELECT object_id, COUNT(*) sightings FROM object_sighting "
             "GROUP BY object_id) s ON s.object_id=o.id "
@@ -709,21 +719,29 @@ class MemoryEngine:
             od, of_ = P["obj_dormant"], P["obj_forget"]
             if od is None or of_ is None:
                 continue                        # archival: objects immortal
-            dtau = now_cache[d_id] - float(r["lst"] or 0)
             mult = 3.0 if r["sx"] >= 3 else 1.0
-            if dtau >= of_ * mult and (
+            if wall_axis:
+                # Plain timestamp index: age by calendar time since the last
+                # sighting. No renewal — see prune()'s docstring. A missing wall
+                # stamp falls back to the creation stamp, and a missing one of
+                # those is treated as infinitely stale rather than never stale.
+                dmeas = self._wall_age_days(wall_base, r["lsw"])
+            else:
+                dmeas = now_cache[d_id] - float(r["lst"] or 0)
+            if dmeas >= of_ * mult and (
                     r["status"] != "stable" or of_ * mult >= 75 * mult):
                 # load-bearing check: if the entity is still named in recent
                 # consolidations (or heavily re-sighted since the last prune),
                 # extend its TTL instead of forgetting it (spaced repetition,
                 # after Ebbinghaus + Rescorla-Wagner — retention re-earned
                 # each cycle, never permanent).
-                if self._renew_load_bearing(dom_cache, d_id, r, now_cache):
+                if not wall_axis and self._renew_load_bearing(
+                        dom_cache, d_id, r, now_cache):
                     rep["objects_renewed"] += 1
                 else:
                     self.store.set_object_status(str(r["id"]), "forgotten")
                     rep["objects_forgotten"] += 1
-            elif dtau >= od * mult and r["status"] not in ("stable", "dormant"):
+            elif dmeas >= od * mult and r["status"] not in ("stable", "dormant"):
                 self.store.set_object_status(str(r["id"]), "dormant")
                 rep["objects_dormant"] += 1
 
@@ -738,6 +756,46 @@ class MemoryEngine:
             self.store._commit()
 
         return PruneReport(**rep)
+
+    def _wall_base(self, wall_now: float | None) -> float:
+        """Unix timestamp (seconds) used as "now" on the wall decay axis.
+
+        `wall` is stored as ISO-8601 TEXT, so MAX(wall) comes back as a *string*.
+        Returning it raw made (wall_base - ep.wall.timestamp()) raise TypeError
+        whenever a caller passed decay_axis="wall" without an explicit wall_now —
+        the E1 driver always passed one, which is why it went unnoticed. Parse it
+        here, and take the newest stamp across episodes AND objects, since the
+        object layer is aged against the same base.
+        """
+        if wall_now is not None:
+            return float(wall_now)
+        stamps: list[str] = []
+        for sql in ("SELECT MAX(wall) w FROM episode",
+                    "SELECT MAX(last_seen_wall) w FROM object"):
+            row = self.store.conn.execute(sql).fetchone()
+            if row and row["w"]:
+                stamps.append(str(row["w"]))
+        best = 0.0
+        for s in stamps:
+            try:
+                best = max(best, datetime.fromisoformat(s).timestamp())
+            except ValueError:                  # pragma: no cover - defensive
+                continue
+        return best
+
+    @staticmethod
+    def _wall_age_days(wall_base: float, last_seen_wall: str | None) -> float:
+        """Age in days between wall_base and an ISO-8601 stamp.
+
+        Returns inf when no stamp is available: an object with no recorded
+        sighting time is maximally stale, never minimally stale.
+        """
+        if not last_seen_wall:
+            return math.inf
+        try:
+            return (wall_base - datetime.fromisoformat(last_seen_wall).timestamp()) / 86400.0
+        except ValueError:                      # pragma: no cover - defensive
+            return math.inf
 
     def _renew_load_bearing(self, dom_cache: dict, d_id: int,
                             r: sqlite3.Row, now_cache: dict) -> bool:
