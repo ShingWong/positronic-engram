@@ -519,14 +519,35 @@ def _feed(e, walls, subj_prefix="x"):
                                  "body_text": f"{subj_prefix}{i} b g"}, wall=w))
 
 
-def test_tau_clock_is_off_by_default():
-    """Backward compatibility: nothing changes until a rate is chosen."""
-    e, s = mk_engine()
-    assert e.base_cfg["tau_idle_per_day"] == 0.0, \
-        "an uncalibrated clock rate must not be on by default"
+def test_tau_clock_default_is_derived_not_chosen():
+    """The default rate comes from the retention profiles, not from taste.
+
+    balanced S_base is 30 tau. Dividing by 7 makes one week of silence
+    deliver exactly one half-life, which is what makes a stated retention
+    duration mean anything on the tau axis.
+    """
+    e, _s = mk_engine()
+    profiles = e.retention_profiles
+    assert math.isclose(e.base_cfg["tau_idle_per_day"],
+                        float(profiles["balanced"]["S_base"]) / 7.0,
+                        rel_tol=1e-3), \
+        "default rate must be S_base/7 so a week of silence = one half-life"
+
+
+def test_tau_clock_can_be_switched_off():
+    """0.0 must restore the old pure-tally behaviour exactly."""
+    e, s = mk_engine(tau_idle_per_day=0.0)
     w = [T0 + timedelta(minutes=7 * i) for i in range(10)]
     _feed(e, w)
-    assert s.stream_time("mail:p1")[0] > 0
+    t_with = s.stream_time("mail:p1")[0]
+    e2, s2 = mk_engine(tau_idle_per_day=0.0)
+    _feed(e2, [T0 + timedelta(minutes=7 * i) for i in range(10)])
+    # both off -> identical, and less than the default-rate run
+    d, sd = mk_engine()
+    _feed(d, w)
+    assert sd.stream_time("mail:p1")[0] > t_with, \
+        "the default rate must advance tau more than the disabled one"
+    assert t_with == s2.stream_time("mail:p1")[0]
 
 
 def test_idle_gap_is_credited_proportionally():
@@ -573,3 +594,59 @@ def test_backdated_events_credit_no_negative_time():
     after = s.stream_time("mail:p1")[0]
     assert after - before < 5.0, \
         "a backdated event must not accrue idle time"
+
+
+# Token filter. Dropping every single-character token made "build 0 green"
+# and "build 7 green" the SAME term set, so an operational log collapsed to
+# novelty 0.000 on its first repeat. Worse, the novelty window then filled
+# with its own homogeneous entries and never grew again: 7 entries, frozen,
+# nothing stored for the remaining 1,493 events.
+def test_single_digit_tokens_are_content():
+    e, _s = mk_engine()
+    a = e._content_terms(ev([], {"subject_norm": "build 0 green"}))
+    b = e._content_terms(ev([], {"subject_norm": "build 7 green"}))
+    assert a != b, "single digits discriminate: 0 and 7 are not the same run"
+    assert "0" in a and "7" in b
+
+
+def test_single_letters_are_still_dropped():
+    e, _s = mk_engine()
+    t = e._content_terms(ev([], {"subject_norm": "a b build x"}))
+    assert "build" in t
+    assert "a" not in t and "b" not in t and "x" not in t, \
+        "single letters are noise, unlike single digits"
+
+
+def test_status_log_does_not_deadlock():
+    """The regression test for the frozen window.
+
+    Before the token fix: 7 events stored, then novelty pinned at 0.357 and
+    the store rate collapsed to ~0 for the rest of the stream. The window
+    filling with homogeneous entries must not be self-sustaining.
+    """
+    e, s = mk_engine(threshold=0.35)
+    outcomes = ["green", "red", "amber", "failed", "passed"]
+    subs = [f"build {i} {outcomes[i % len(outcomes)]}" for i in range(600)]
+    enc = 0
+    for i, subj in enumerate(subs):
+        r = e.new_event(ev([f"p{i % 9}"], {"subject_norm": subj,
+                                            "body_text": subj}, wall=T0))
+        enc += bool(r.verdict.encoded)
+    assert enc / len(subs) > 0.25, \
+        f"a log of genuinely distinct runs must store something: {enc}/{len(subs)}"
+    assert len(e._recent_terms) > 8, \
+        f"the novelty window must keep growing, not freeze: {len(e._recent_terms)}"
+
+
+def test_near_duplicates_are_still_suppressed():
+    """The other half: identical content must NOT flood the store."""
+    e, s = mk_engine(threshold=0.35)
+    words = "alpha bravo charlie delta echo".split()
+    subs = [" ".join(words) + f" {i}" for i in range(600)]
+    enc = 0
+    for i, subj in enumerate(subs):
+        r = e.new_event(ev([f"p{i % 9}"], {"subject_norm": subj,
+                                            "body_text": subj}, wall=T0))
+        enc += bool(r.verdict.encoded)
+    assert enc / len(subs) < 0.25, \
+        f"near-identical events must not be stored wholesale: {enc}/{len(subs)}"

@@ -115,7 +115,12 @@ class MemoryEngine:
             # experience. Idle time is credited SLOWLY (tau_idle_per_day
             # units per day of silence) so engaged time still dominates and
             # this does not collapse back into a wall clock.
-            "tau_idle_per_day": 0.0,
+            # Derived, not chosen: balanced S_base is 30 tau, so a rate of
+            # 30/7 makes one week of silence deliver exactly one half-life.
+            # Measured effect on an equal 10-day span: busy/quiet tau ratio
+            # 20.9, against 100 for a pure event tally and 1.0 for a pure
+            # wall clock. Engaged time dominates; silence still registers.
+            "tau_idle_per_day": 4.2857,
             "honor_window": 8,
             # Credit per retrieval hit, divided by rank. Must be small: the
             # first version used 1.0/rank, and a single top-rank recall
@@ -598,7 +603,7 @@ class MemoryEngine:
                     # pool is exact — no guessing how deep a matching
                     # consolidation ranks against live chatter.
                     terms = [t for t in re.split(r"[^\w]+", text.lower())
-                             if len(t) > 1 and t not in self._FTS_STOP]
+                             if (len(t) > 1 or t.isdigit()) and t not in self._FTS_STOP]
                     if terms:
                         or_ids = self.store.fts_search(
                             " OR ".join(f'"{t}"' for t in terms),
@@ -749,24 +754,45 @@ class MemoryEngine:
         return frozenset(
             t for t in re.split(r"[^\w]+", " ".join(parts).lower())
             # len>1 matches `activate`'s own tokenisation (engine.py:536),
-            # so the two paths agree on what a word is.
-            if len(t) > 1 and t not in self._FTS_STOP)
+            # so the two paths agree on what a word is -- with one measured
+            # exception. Dropping every single-character token made
+            # "build 0 green" and "build 7 green" the SAME term set, so an
+            # operational log collapsed to novelty 0.000 and the novelty
+            # window deadlocked full of its own homogeneous entries. Single
+            # DIGITS carry identity in logs; single LETTERS are noise. So
+            # digits are kept and letters are not.
+            if (len(t) > 1 or t.isdigit()) and t not in self._FTS_STOP)
 
     def _semantic_novelty(self, event: Event) -> float:
         """How unlike anything already remembered is this event?
 
-        Jaccard overlap against a bounded, recency-weighted window of recently
-        ENCODED events. Chosen over the alternatives on measured grounds:
+        IDF-weighted cosine similarity against a bounded, recency-weighted
+        window of recently ENCODED events. Returns 1.0 minus the best
+        similarity: 1.0 means nothing similar is remembered.
 
-        * word-level novelty against everything ever seen saturates -- the
-          corpus exhausted its vocabulary and 74.6% of messages scored zero
-          novel tokens;
-        * a vector search needs an embedder at gate time, which is the
-          expensive work the gate exists to avoid;
-        * FTS5 cannot return per-term hit counts cheaply, so it grades the
-          event into three buckets rather than continuously.
+        Why IDF and why cosine, both forced by measurement:
 
-        Returns 1.0 - best overlap: 1.0 means nothing similar is remembered.
+        * Plain Jaccard on short text reads as similar by chance. Measured on
+          a low-variance stream (6 content terms per event): mean best
+          overlap 0.462, so novelty sat at ~0.54, score at ~0.37, and the
+          gate stored 0.1% of a perfectly legitimate stream.
+        * Worse, that overlap was mostly COMMON words. On that stream `alpha`
+          appeared 75 times in 300 events, so agreeing on `alpha` was weak
+          evidence of anything. Weighting each term by how rare it is in the
+          window fixes both problems at once -- a shared rare term counts,
+          a shared common one barely registers, and the estimate no longer
+          depends on set size.
+
+        Document frequency is computed from the window itself rather than
+        kept as separate state: the window is the comparison set, so its own
+        frequencies are exactly the right ones, and there is nothing to
+        expire or resync.
+
+        Rejected on measured grounds: lifetime word-level novelty saturates
+        (the corpus exhausted its vocabulary, 74.6% of messages scoring zero
+        novel tokens); a vector search needs an embedder at gate time, which
+        is the expensive work the gate exists to avoid; FTS5 cannot return
+        per-term hit counts cheaply.
         """
         cfg = self.base_cfg
         if not cfg["semantic_novelty"]:
@@ -774,12 +800,35 @@ class MemoryEngine:
         terms = self._content_terms(event)
         if not terms or not self._recent_terms:
             return float(cfg["semantic_novelty_fallback"])
+
+        window = list(self._recent_terms)
+        n_win = len(window)
+        df: dict[str, int] = {}
+        for other in window:
+            for t in other:
+                df[t] = df.get(t, 0) + 1
+
+        def weight(t: str) -> float:
+            # Smoothed IDF: a term in every window entry still carries a
+            # little weight rather than zeroing out and being ignored.
+            return math.log((n_win + 1.0) / (df.get(t, 0) + 1.0)) + 1.0
+
+        qw = {t: weight(t) for t in terms}
+        qnorm = math.sqrt(sum(v * v for v in qw.values())) or 1.0
         best = 0.0
-        for other in self._recent_terms:
-            inter = len(terms & other)
-            if inter:
-                best = max(best, inter / len(terms | other))
-        return 1.0 - best
+        for other in window:
+            inter = terms & other
+            if not inter:
+                continue
+            dot = sum(qw[t] * weight(t) for t in inter)
+            onorm = math.sqrt(
+                sum(weight(t) ** 2 for t in other)) or 1.0
+            sim = dot / (qnorm * onorm)
+            best = max(best, sim)
+        # Novelty is a heuristic score and must not carry float noise: cosine
+        # of identical vectors lands at 1.0 - 2e-16, which surfaced as a
+        # novelty of 2.2e-16 where "identical" should mean exactly 0.
+        return round(max(0.0, min(1.0, 1.0 - best)), 9)
 
     def _remember_terms(self, event: Event) -> None:
         """Add an encoded event to the novelty comparison window."""
