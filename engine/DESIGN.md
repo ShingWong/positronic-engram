@@ -64,3 +64,9 @@ All weights live in engine config; the point is *visibility*, not correctness
 Per-stream proper time (`stream_tau`), advanced only by surprise-weighted
 events (H14: uneventful ≈ zero). Cross-stream comparison deferred to
 activation-currency layer (T2 decision) — documented open problem.
+
+## Object layer
+
+Not covered here — see [OBJECT_SALIENCE.md](OBJECT_SALIENCE.md) for the
+reinforcement rule, the τ denominated constants, and the open decisions on
+ladder revival and TTL renewal.

@@ -331,3 +331,92 @@ def test_object_wall_axis_never_renews():
     status = s.conn.execute(
         "SELECT status FROM object WHERE id=?", (oid,)).fetchone()["status"]
     assert status == "forgotten"
+
+
+def test_ttl_renewal_defers_forgetting_by_exactly_one_cycle():
+    """CHARACTERIZATION: renewal is a one-cycle deferral, not interval growth.
+
+    The retention-profile docstring describes TTL renewal as advancing an
+    object's "survival clock" by renew_ratio x (now - anchor), capped at
+    renew_max -- spaced repetition, after Ebbinghaus + Rescorla-Wagner. That
+    is not what the code does, and the gap was invisible because the
+    arithmetic *runs* (last_renewal_tau is written, objects_renewed is
+    counted, a trace event fires) while never reaching the survival test.
+
+    The survival test compares dmeas = now - last_seen_tau against
+    obj_forget. _renew_load_bearing writes last_renewal_tau, and nothing
+    reads that column to build dmeas. So renewal changes nothing about how
+    long an object lives; it only skips this cycle's forget.
+
+    Pinned deliberately: this is the behaviour the released engine has, and
+    the arXiv paper now reports it as a limitation. If renewal is ever made
+    real, this test may or may not catch it — it pins the two-cycle sequence,
+    not the absence of a mechanism, so treat it as documentation that must be
+    re-read rather than as a tripwire. (Claiming it would trip on any renewal
+    fix would be overreach: a fix that lengthened the anchor by 2730 against
+    an obj_forget of 1200 still leaves the object forgotten on cycle 2, and
+    this test would pass. The discriminating question — whether an object
+    that is continuously *mentioned* in consolidations but never re-sighted
+    survives indefinitely — is NOT pinned here, and is open.)
+
+    Discriminating within its stated scope: it asserts renewal genuinely fired
+    (objects_renewed >= 1) and wrote a large anchor (> obj_forget), so
+    "forgotten anyway" cannot be mistaken for "never renewed". What it pins is
+    that the anchor does not protect, and that a second consecutive renewal is
+    impossible because the load-bearing window closes at the prune boundary.
+    """
+    e, s = mk()
+    for i in range(2):
+        e.new_event(_sess_event(
+            f"mention {i}", "shipped persona-bot-v2 to web2 again"))
+    oid = s.conn.execute(
+        "SELECT id FROM object WHERE canonical_name='web2'").fetchone()["id"]
+
+    def _age():
+        s.conn.execute(
+            "UPDATE object SET first_seen_tau=0, last_seen_tau=0 WHERE id=?",
+            (oid,))
+        s.conn.execute(
+            "UPDATE stream SET tau=9000.0, mono=500 WHERE stream=?",
+            ("kairos:sessions",))
+        s._commit()
+
+    def _status():
+        return s.conn.execute(
+            "SELECT status, last_renewal_tau FROM object WHERE id=?",
+            (oid,)).fetchone()
+
+    P = e.retention_profiles["balanced"]
+    assert P.get("renew_ratio", 0.0) > 0.0, \
+        "precondition: renewal must be enabled on the balanced profile"
+
+    # cycle 1: load-bearing, so renewal fires and the object survives
+    _age()
+    rep1 = e.prune(tau_now=9100.0, decay_axis="tau")
+    row = _status()
+    assert rep1.objects_renewed >= 1, \
+        "precondition: cycle 1 must actually renew, or this proves nothing"
+    assert row["status"] != "forgotten", "renewal must defer this cycle"
+
+    # the arithmetic really ran, and produced a large anchor
+    assert row["last_renewal_tau"] is not None, \
+        "renewal must have written its anchor, or 'forgotten anyway' is vacuous"
+    assert row["last_renewal_tau"] > P["obj_forget"], (
+        f"the renewal anchor ({row['last_renewal_tau']}) should exceed "
+        f"obj_forget ({P['obj_forget']}) — if renewal extended survival this "
+        f"object would be protected, which is exactly what it is not")
+
+    # cycle 2: no new sightings, the load-bearing window has closed, and the
+    # object is forgotten DESPITE the anchor written in cycle 1.
+    rep2 = e.prune(tau_now=9200.0, decay_axis="tau")
+    row2 = _status()
+    assert row2["last_renewal_tau"] == row["last_renewal_tau"], \
+        "precondition: the renewal anchor must be unchanged between cycles"
+    assert row2["status"] == "forgotten", (
+        "CURRENT BEHAVIOUR, deliberately pinned: the renewal anchor from "
+        "cycle 1 does not protect the object, because obj_forget is tested "
+        "against last_seen_tau and not against last_renewal_tau")
+    assert rep2.objects_renewed == 0, \
+        "and it cannot renew twice in a row: the load-bearing evidence window "\
+        "closes at the prune boundary, so an unrefreshed object renews at "\
+        "most once"
