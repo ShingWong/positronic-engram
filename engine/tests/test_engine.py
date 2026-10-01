@@ -499,3 +499,77 @@ def test_gate_no_partial_credit_branch_is_unreachable():
     r = e.new_event(ev(["p_mix"], {"subject_norm": "v1", "sender": "nobody"}))
     assert r.verdict.novelty == 1.0, "mixed match/violate -> 1.0, not 0.6"
     assert r.verdict.novelty != 0.6
+
+
+# ---- tau as a clock (H-tau) -------------------------------------------------
+# tau used to advance only when an event arrived, so it counted experienced
+# events and was blind to elapsed silence. Measured: a 100x difference in
+# event rate produced an 84.9x difference in tau. An idle agent's clock
+# froze, and tau-keyed decay never fired for it.
+#
+# tau_idle_per_day credits the silence preceding each event. Accrued per
+# event rather than at prune, so every inter-event gap is credited exactly
+# once and the idle credited over a window is rate*span regardless of how
+# the events were distributed.
+
+
+def _feed(e, walls, subj_prefix="x"):
+    for i, w in enumerate(walls):
+        e.new_event(ev(["p_a"], {"subject_norm": f"{subj_prefix}{i}",
+                                 "body_text": f"{subj_prefix}{i} b g"}, wall=w))
+
+
+def test_tau_clock_is_off_by_default():
+    """Backward compatibility: nothing changes until a rate is chosen."""
+    e, s = mk_engine()
+    assert e.base_cfg["tau_idle_per_day"] == 0.0, \
+        "an uncalibrated clock rate must not be on by default"
+    w = [T0 + timedelta(minutes=7 * i) for i in range(10)]
+    _feed(e, w)
+    assert s.stream_time("mail:p1")[0] > 0
+
+
+def test_idle_gap_is_credited_proportionally():
+    quiet_e, quiet_s = mk_engine(tau_idle_per_day=5.0)
+    busy_e, busy_s = mk_engine(tau_idle_per_day=5.0)
+    # 10 events, 7 minutes apart -> 63 min of gaps between the first and last
+    w7 = [T0 + timedelta(minutes=7 * i) for i in range(10)]
+    # 10 events, 7 hours apart -> 63 h of gaps, 60x the wall time
+    w7h = [T0 + timedelta(hours=7 * i) for i in range(10)]
+    _feed(quiet_e, w7)
+    _feed(busy_e, w7h)
+    tq = quiet_s.stream_time("mail:p1")[0]
+    tb = busy_s.stream_time("mail:p1")[0]
+    # both see the same number of events, so the difference is idle credit
+    expected_gap_hours = 63
+    idle_b = 5.0 * (expected_gap_hours / 24.0)
+    assert tb - tq > idle_b * 0.9, \
+        f"a 60x longer span must credit far more silence: {tq} vs {tb}"
+
+
+def test_idle_credit_is_independent_of_event_distribution():
+    """The property that makes it a clock: same span, same idle credit."""
+    sparse_e, sparse_s = mk_engine(tau_idle_per_day=5.0)
+    dense_e, dense_s = mk_engine(tau_idle_per_day=5.0)
+    span_days = 10
+    sparse = [T0 + timedelta(days=span_days * i / 19) for i in range(20)]
+    dense = [T0 + timedelta(days=span_days * i / 1999) for i in range(2000)]
+    _feed(sparse_e, sparse, "s")
+    _feed(dense_e, dense, "d")
+    ts = sparse_s.stream_time("mail:p1")[0]
+    td = dense_s.stream_time("mail:p1")[0]
+    # novelty credit differs by 100x, but the idle credit is rate*span in
+    # both, so tau must be far closer than the raw event counts would imply
+    assert td / ts < 100, f"still tracking event rate almost 1:1: {td/ts:.1f}"
+    assert td / ts > 1.5, f"but silence must still register: {td/ts:.1f}"
+
+
+def test_backdated_events_credit_no_negative_time():
+    """Replaying history must not credit silence that has not happened."""
+    e, s = mk_engine(tau_idle_per_day=5.0)
+    _feed(e, [T0 + timedelta(days=5 * i) for i in range(5)])
+    before = s.stream_time("mail:p1")[0]
+    _feed(e, [T0])                       # an event stamped before the last
+    after = s.stream_time("mail:p1")[0]
+    assert after - before < 5.0, \
+        "a backdated event must not accrue idle time"

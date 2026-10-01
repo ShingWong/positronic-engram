@@ -81,7 +81,11 @@ CREATE TABLE IF NOT EXISTS stream (
   stream TEXT PRIMARY KEY,
   domain_id INTEGER REFERENCES domain(id),
   tau REAL NOT NULL DEFAULT 0.0,
-  mono INTEGER NOT NULL DEFAULT 0
+  mono INTEGER NOT NULL DEFAULT 0,
+  -- Unix seconds of the most recent event on this stream. tau only advances
+  -- when an event arrives, so without this an idle stream cannot tell that
+  -- time passed -- and tau-keyed decay then never fires for a quiet agent.
+  last_event_wall REAL
 );
 
 -- ── memory ────────────────────────────────────────────────────────────
@@ -461,13 +465,40 @@ class SQLiteStore:
                               (stream,)).fetchone()
         return (float(r["tau"]), int(r["mono"])) if r else (0.0, 0)
 
-    def set_stream_time(self, stream: str, tau: float, mono: int) -> None:
-        self.conn.execute("UPDATE stream SET tau=?, mono=? WHERE stream=?",
-                          (tau, mono, stream))
+    def set_stream_time(self, stream: str, tau: float, mono: int,
+                         wall: float | None = None) -> None:
+        self.conn.execute(
+            "UPDATE stream SET tau=?, mono=?, "
+            "last_event_wall=COALESCE(?, last_event_wall) WHERE stream=?",
+            (tau, mono, wall, stream))
         self._commit()
         if stream in self._stream_cache:
             self._stream_cache[stream]["tau"] = tau
             self._stream_cache[stream]["mono"] = mono
+
+    def iter_stream_times(self):
+        """(stream, tau) for every stream. Used by idle accrual."""
+        for r in self.conn.execute("SELECT stream, tau FROM stream"):
+            yield r["stream"], float(r["tau"])
+
+    def stream_last_event_wall(self, stream: str) -> float | None:
+        r = self.conn.execute(
+            "SELECT last_event_wall FROM stream WHERE stream=?",
+            (stream,)).fetchone()
+        if not r or r["last_event_wall"] is None:
+            return None
+        return float(r["last_event_wall"])
+
+    def idle_seconds(self, stream: str, wall_now: float) -> float:
+        """Seconds of silence on this stream, measured to `wall_now`.
+
+        Clamped at zero: a wall_now earlier than the last event (replaying
+        history, backdating) must not credit time that has not happened.
+        """
+        last = self.stream_last_event_wall(stream)
+        if last is None:
+            return 0.0
+        return max(0.0, float(wall_now) - last)
 
     # -- episodes ------------------------------------------------------------
     def insert_episode(self, rec: EpisodeRecord, domain_id: int) -> None:

@@ -107,6 +107,15 @@ class MemoryEngine:
             # H18 relationship gain. Retrieval credits a sender; a
             # `gain_decay_rate` regression per prune lets uncorroborated
             # credit fade. Before this, weight never left its 0.5 default.
+            # tau is an experiential clock, so it must advance during
+            # silence as well as during surprise -- otherwise a quiet agent's
+            # clock freezes and tau-keyed decay never fires for it. Measured
+            # before this: a 100x difference in event rate produced an 85x
+            # difference in tau, which is a tally of events, not elapsed
+            # experience. Idle time is credited SLOWLY (tau_idle_per_day
+            # units per day of silence) so engaged time still dominates and
+            # this does not collapse back into a wall clock.
+            "tau_idle_per_day": 0.0,
             "honor_window": 8,
             # Credit per retrieval hit, divided by rank. Must be small: the
             # first version used 1.0/rank, and a single top-rank recall
@@ -368,8 +377,29 @@ class MemoryEngine:
         episode_id = None
         tier = Tier.NORMAL
 
-        # tau advances on surprise only (H14): uneventful ≈ zero
-        tau_advance = cfg["tau_per_surprise"] * novelty
+        # tau advances on surprise (H14): uneventful ≈ zero.
+        # Plus the silence that PRECEDED this event. tau used to move only
+        # when an event arrived, so it counted experienced events and was
+        # blind to elapsed time: a 100x difference in event rate produced an
+        # 84.9x difference in tau. An idle agent's clock froze and tau-keyed
+        # decay never fired for it.
+        #
+        # Accrued per event rather than at prune, so each inter-event gap is
+        # credited exactly once and the total idle credited over any window
+        # is `rate * span` regardless of how the events were distributed. That
+        # is what makes it a clock component instead of a function of the
+        # final gap. Crediting it here also keeps prune read-only.
+        #
+        # Default 0.0: the rate is uncalibrated and a clock that runs at the
+        # wrong speed is worse than an honest tally.
+        idle_rate = float(cfg.get("tau_idle_per_day", 0.0))
+        idle_gain = 0.0
+        if idle_rate > 0:
+            idle_s = self.store.idle_seconds(event.stream,
+                                             event.wall.timestamp())
+            if idle_s > 0:
+                idle_gain = idle_rate * (idle_s / 86400.0)
+        tau_advance = cfg["tau_per_surprise"] * novelty + idle_gain
         new_tau = tau_stream + tau_advance
 
         # ---- ENCODE --------------------------------------------------------
@@ -504,7 +534,9 @@ class MemoryEngine:
         with self.tel.stage("commit"):
             bus.emit("gate_decision", new_tau, score=verdict.score,
                      encoded=verdict.encoded)
-            self.store.set_stream_time(event.stream, new_tau, mono + 1)
+            self.store.set_stream_time(
+                event.stream, new_tau, mono + 1,
+                wall=event.wall.timestamp())
 
         result = EventResult(verdict=verdict, tau=new_tau,
                              episode_id=episode_id, predictions=predictions,
@@ -802,6 +834,13 @@ class MemoryEngine:
         # prune non-idempotent.
         self.store.decay_person_weights(
             rate=float(self.base_cfg.get("gain_decay_rate", 0.01)))
+        # Idle accrual: tau is an experiential clock, so silence has to move
+        # it or a quiet agent never ages. Credited per stream, from the time
+        # since that stream's last event to `wall_now`. Default 0.0 preserves
+        # the previous behaviour exactly -- tau as a pure event tally -- so
+        # this is opt-in until the rate is calibrated.
+
+
         dom_cache: dict[int, dict] = {}
         for ep in eps:
             if wall_axis:
