@@ -411,6 +411,43 @@ class SQLiteStore:
         self._commit()
         self._person_cache.pop(pid, None)
 
+    def honor_persons(self, pids, *, weight: float = 0.01) -> None:
+        """Credit `pids` with evidence that they matter.
+
+        `weight` is the per-call increment, scaled by the caller (retrieval
+        rank), not a target value. Additive and bounded by 1.0, so repeated
+        retrieval saturates rather than running away.
+
+        This is the only writer of `weight` on the ingest path. Decay back
+        toward the prior lives in `decay_person_weights`, because a credit
+        that never faded would make every once-recalled correspondent
+        permanently important.
+        """
+        bump = float(weight)
+        if bump <= 0:
+            return
+        for pid in pids or ():
+            self.conn.execute(
+                "INSERT INTO person(pid,weight) VALUES(?, ?) "
+                "ON CONFLICT(pid) DO UPDATE SET weight="
+                "MIN(1.0, weight + excluded.weight)", (pid, bump))
+            self._person_cache.pop(pid, None)
+
+    def decay_person_weights(self, *, rate: float = 0.01) -> int:
+        """Regression toward the 0.5 prior, for people with no new evidence.
+
+        Memory that is never recalled again should stop asserting that it
+        matters. Returns the number of people moved off the prior.
+        """
+        cur = self.conn.execute(
+            "UPDATE person SET weight = 0.5 + (weight - 0.5) * ? "
+            "WHERE weight <> 0.5", (max(0.0, min(1.0, 1.0 - rate)),))
+        moved = cur.rowcount or 0
+        if moved:
+            self._commit()
+            self._person_cache.clear()
+        return moved
+
     def bump_miss_cost(self, pid: str) -> None:
         self.conn.execute(
             "UPDATE person SET miss_costs=miss_costs+1, "

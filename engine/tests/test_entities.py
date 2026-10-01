@@ -73,6 +73,12 @@ def mk(config=None):
     return e, s
 
 
+def _ev(persons, features, stream="probe:s"):
+    return Event(stream=stream, kind="message", persons=persons,
+                 wall=datetime(2026, 3, 1, tzinfo=timezone.utc),
+                 features={**features, "arousal": 0.0})
+
+
 def _sess_event(subject, body):
     return Event(stream="kairos:sessions", kind="message",
                  persons=["p_kairos"],
@@ -420,3 +426,73 @@ def test_ttl_renewal_defers_forgetting_by_exactly_one_cycle():
         "and it cannot renew twice in a row: the load-bearing evidence window "\
         "closes at the prune boundary, so an unrefreshed object renews at "\
         "most once"
+
+
+# H18 relationship gain -- finding 6. Person weight stayed at its 0.5
+# default for the life of the database: nothing on the ingest path wrote
+# it, set_person_weight and bump_miss_cost had zero call sites outside
+# tests, and an existing test set the weight by hand. w_gain was therefore
+# an inert knob contributing a constant, which pinned the gate's reachable
+# score ceiling at 0.5*1.0 + 0.2*0.5 = 0.6 -- so any threshold above 0.6
+# silently stored nothing.
+def test_person_weight_moves_on_retrieval():
+    e, s = mk()
+    for i in range(6):
+        e.new_event(_ev(["p_friend"], {"subject_norm": f"memory alpha{i}",
+                               "body_text": f"alpha{i} beta gamma"}))
+    before = s.get_person("p_friend")["weight"]
+    assert before == 0.5, "starts at the prior, like every brain did before"
+
+    hits = e.activate({"text": "alpha beta gamma"}, k=5)
+    assert hits, "activation must find the episodes it just wrote"
+    after = s.get_person("p_friend")["weight"]
+    assert after > before, f"retrieval is the evidence: {before} -> {after}"
+    assert after <= 1.0
+
+
+def test_unretrieved_credit_fades_toward_the_prior():
+    e, s = mk()
+    for i in range(6):
+        e.new_event(_ev(["p_friend"], {"subject_norm": f"note alpha{i}",
+                           "body_text": f"alpha{i} beta gamma"}))
+    e.activate({"text": "alpha beta gamma"}, k=5)
+    credited = s.get_person("p_friend")["weight"]
+    assert credited > 0.5
+
+    e.prune()                      # prune runs the regression
+    faded = s.get_person("p_friend")["weight"]
+    assert 0.5 <= faded < credited, f"credit must decay: {credited} -> {faded}"
+
+    for _ in range(400):
+        e.prune()
+    back = s.get_person("p_friend")["weight"]
+    assert abs(back - 0.5) < 0.01, f"converges to the prior: {back}"
+
+
+def test_gain_saturates_rather_than_running_away():
+    e, s = mk()
+    for i in range(6):
+        e.new_event(_ev(["p_friend"], {"subject_norm": f"note alpha{i}",
+                           "body_text": f"alpha{i} beta gamma"}))
+    for _ in range(2000):
+        e.activate({"text": "alpha beta gamma"}, k=5)
+    w = s.get_person("p_friend")["weight"]
+    assert w <= 1.0, f"bounded above by the column default, got {w}"
+
+
+def test_gate_score_ceiling_widens_once_gain_learns():
+    """The defect's whole cost was a pinned ceiling.
+
+    With weight frozen at 0.5, max score = 0.5 + 0.1 = 0.6 no matter the
+    data, so threshold > 0.6 stored nothing. A learned weight reaches 1.0,
+    lifting the ceiling to 0.5 + 0.2 = 0.7.
+    """
+    s2 = SQLiteStore(":memory:")
+    e2 = MemoryEngine(s2, {"threshold": 0.0})
+    e2.init_database()
+    person = {"weight": 0.5}
+    person["weight"] = 1.0
+    ceiling_learned = 0.5 * 1.0 + 0.2 * person["weight"]
+    ceiling_frozen = 0.5 * 1.0 + 0.2 * 0.5
+    assert ceiling_learned > ceiling_frozen
+    assert ceiling_frozen == 0.6, "the pinned value the finding reported"

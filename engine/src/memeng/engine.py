@@ -104,6 +104,15 @@ class MemoryEngine:
             # window). Matches the value this used to hardcode, so deployments
             # without text see no behaviour change.
             "semantic_novelty_fallback": 0.9,
+            # H18 relationship gain. Retrieval credits a sender; a
+            # `gain_decay_rate` regression per prune lets uncorroborated
+            # credit fade. Before this, weight never left its 0.5 default.
+            "honor_window": 8,
+            # Credit per retrieval hit, divided by rank. Must be small: the
+            # first version used 1.0/rank, and a single top-rank recall
+            # saturated weight from 0.5 to 1.0.
+            "honor_credit": 0.01,
+            "gain_decay_rate": 0.01,
             "entity_extraction": True,
             "min_semantic_sim": 0.35,
         }
@@ -120,6 +129,8 @@ class MemoryEngine:
         # against what is actually stored rather than against everything seen.
         self._recent_terms: deque[frozenset] = deque(
             maxlen=max(1, int(cfg["semantic_novelty_window"])))
+        # How many ranked results may credit their senders with evidence.
+        self._honor_window = max(0, int(cfg["honor_window"]))
 
         # ── retention profiles: application-controlled forgetting ─────────
         # Same brain hardware; the POLICY differs per deployment/domain.
@@ -596,6 +607,22 @@ class MemoryEngine:
             fused = rrf_fuse(channels, k=k if not consolidation else k * 4,
                          weights=weights)
             persons = set(cue.get("persons") or [])
+            # H18 relationship gain, finally fed. Retrieval is the evidence:
+            # an episode that keeps being recalled is worth more at encode
+            # time. Before this, `weight` stayed at its 0.5 default for the
+            # life of the database -- nothing in the engine ever wrote it,
+            # `set_person_weight` and `bump_miss_cost` had no call sites, and
+            # an existing test set the weight by hand. `w_gain` was therefore
+            # an inert knob contributing a constant to the gate score.
+            #
+            # Ranked-weighted, and only for results the caller actually gets
+            # back, so a large k that is then truncated cannot inflate it.
+            for rank, eid in enumerate(fused[:self._honor_window], 1):
+                ep = eps_by_id.get(eid)
+                if ep and not consolidation:
+                    self.store.honor_persons(
+                        ep.persons or [],
+                        weight=float(self.base_cfg["honor_credit"]) / rank)
             out = []
             for rank, eid in enumerate(fused, 1):
                 ep = eps_by_id.get(eid)
@@ -769,6 +796,12 @@ class MemoryEngine:
         # polytemporal accumulator; wall-axis uses wall-clock age (unix sec).
         wall_axis = decay_axis == "wall"
         wall_base = self._wall_base(wall_now)
+        # H18 evidence decay. Runs on the prune pass so uncorroborated
+        # relationship credit regresses toward the prior without needing its
+        # own timer. Read-only with respect to episodes, so it cannot make a
+        # prune non-idempotent.
+        self.store.decay_person_weights(
+            rate=float(self.base_cfg.get("gain_decay_rate", 0.01)))
         dom_cache: dict[int, dict] = {}
         for ep in eps:
             if wall_axis:
