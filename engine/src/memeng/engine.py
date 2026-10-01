@@ -58,9 +58,17 @@ class MemoryEngine:
     _FTS_STOP = frozenset(
         ["a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "in", "is", "it", "of", "on", "or", "that", "the", "this", "to", "was", "were", "with"])
 
-    def __init__(self, store: SQLiteStore, config: dict | None = None) -> None:
-        self.store = store
-        cfg = {
+    @classmethod
+    def default_config(cls) -> dict:
+        """The engine's knob defaults.
+
+        Exposed so callers can validate a supplied config against exactly the
+        keys the engine reads. Hardcoding a second list elsewhere guarantees
+        the two drift, and a typo in an unknown key is silently ignored --
+        which is exactly how the per-brain `threshold` setting sat unread for
+        months.
+        """
+        return {
             "threshold": 0.55,
             "burst_threshold": 0.90,      # H16 escalation
             "w_novelty": 0.5,
@@ -99,6 +107,10 @@ class MemoryEngine:
             "entity_extraction": True,
             "min_semantic_sim": 0.35,
         }
+
+    def __init__(self, store: SQLiteStore, config: dict | None = None) -> None:
+        self.store = store
+        cfg = self.default_config()
         cfg.update(config or {})
         self.base_cfg = cfg
         self.tel = Telemetry()
