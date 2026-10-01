@@ -521,10 +521,23 @@ class SQLiteStore:
 
     def grade_rule(self, rule_id: str, *, matched: bool) -> dict:
         col = ("support_count", "violation_count")[not matched]
+        # Add-one (Laplace) smoothing, evaluated against the POST-update row.
+        # Two defects fixed:
+        #  * SQLite evaluates every SET expression against the pre-update row,
+        #    so the old confidence lagged one event behind the counts. The
+        #    numerator therefore carries the increment itself: +2 when a
+        #    support is added (it lands in the numerator as well), +1 when a
+        #    violation is (it lands only in the denominator).
+        #  * Unsmoothed, a rule with no evidence scored confidence 0.0 -- an
+        #    unproven belief reading as maximally distrusted, which the gate
+        #    now acts on. With add-one, no evidence is 0.5 (matching the
+        #    column default) and 200 violations with no support decay to
+        #    1/203 rather than 0.
+        num = "support_count+2.0" if matched else "support_count+1.0"
         self.conn.execute(
             f"UPDATE causal_rule SET {col}={col}+1, "
-            "confidence=CAST(support_count AS REAL)/"
-            "(support_count+violation_count+2.0) WHERE id=?", (rule_id,))
+            f"confidence=CAST({num} AS REAL)/"
+            "(support_count+violation_count+3.0) WHERE id=?", (rule_id,))
         self._commit()
         r = self.conn.execute("SELECT * FROM causal_rule WHERE id=?",
                               (rule_id,)).fetchone()

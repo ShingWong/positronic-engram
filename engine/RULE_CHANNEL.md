@@ -125,19 +125,71 @@ compute one is already in the engine, three steps too late.
 
 1. **Fix the inducer/evaluator asymmetry.** One resolution of the sender, used by
    both halves. Small, and it removes a way to induce a rule that can never
-   confirm.
+   confirm. — **DONE**
 2. **Make the antecedent and outcome configurable**, defaulting to today's
    `subject_norm → sender`. Removes the mail dependency from a generic engine.
    Pointing it at `sender → to_primary` is measured above if a deployment wants
-   the coverage, but that is a policy choice, not a default.
-3. **Use rule confidence.** A floor on evidence before a rule is trusted, and
-   retirement for rules that carry enough evidence to be disproven. Fixes
-   Finding 1.
+   the coverage, but that is a policy choice, not a default. — **DONE**
+3. **Use rule confidence.** A floor on evidence before a rule is trusted.
+   Fixes Finding 1. — **DONE, but see below**
 4. **Give the gate a semantic novelty term**, computed before the decision.
    Fixes Finding 6, and is the only step that can move τ/message materially.
+   — **NOT DONE.** This is the one that matters.
 
-Steps 1–3 are mechanical and low-risk. Step 4 changes what Eq. 2 in the paper
-describes, so it is a decision rather than an implementation.
+## Step 3 landed, and it barely moves anything
+
+Re-measured on the full corpus after the fix:
+
+| arm | novelty 0.05 / 0.9 / 1.0 | τ/message |
+|---|---|---|
+| `features-raw`, before | 11.9 / 83.3 / 4.8% | 0.8036 |
+| `features-raw`, after | 11.9 / 83.5 / 4.6% | 0.8035 |
+| `features-norm`, before | 15.4 / 74.2 / 10.4% | 0.7788 |
+| `features-norm`, after | 15.4 / 74.8 / 9.8% | 0.7788 |
+
+Novelty 1.0 falls by 0.2 and 0.6 points. τ/message does not move at all — which
+is Finding 5 reproducing itself.
+
+The reason is worth recording, because it revises how much Finding 1 mattered.
+The inducer rewrites a rule's expected outcome to the current top association
+every time it fires, so a rule that starts being violated is *corrected* within
+a few events and converges. Measured over 2,835 induced rules:
+
+```
+zero violations                 1,923  (68%)
+mean violation_count            1.4
+support>0 AND violation>0         613  of 2,835
+fell below the 0.05 floor          16
+```
+
+So on induced traffic the confidence floor is nearly inert — the inducer masks
+it. The fix is still right: it matters for stale or externally-seeded rules,
+where nothing is rewriting the expectation. But it is a correctness fix, not a
+τ fix, and should not be counted as progress on Finding 5.
+
+Two further defects surfaced while implementing it:
+
+- **`grade_rule` computed confidence from pre-update counts.** SQLite evaluates
+  every `SET` expression against the pre-update row, so confidence lagged one
+  event behind the counts it described.
+- **An unproven rule scored confidence 0.0.** Unsmoothed,
+  `support/(support+violation+2)` gives 0 for a rule with no evidence, so a
+  brand-new belief read as maximally distrusted — and the moment the gate acted
+  on confidence, that unproven rule lost its vote. Now add-one smoothed on the
+  post-update row: no evidence is 0.5, matching the column default, and a rule
+  with 200 violations and no support decays to 1/203 rather than 0.
+
+The second one is a good illustration of why a computed-but-unread field can
+hide for a long time: the formula looked reasonable and nobody was checking it
+against a belief with no evidence.
+
+## What still has to happen
+
+Step 4 is the whole ballgame. Every mechanical fix above is a correctness fix;
+none of them changes what novelty means, and novelty is the only thing that
+sets τ. Until the gate can say "this was routine and I did not predict it",
+τ will keep tracking message count, and any constant denominated in τ will keep
+encoding nothing.
 
 ## On calibrating anything in τ
 

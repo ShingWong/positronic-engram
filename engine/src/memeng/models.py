@@ -77,6 +77,11 @@ class Prediction:
     expected: Any
     actual: Any | None = None
     matched: bool | None = None    # filled at gate time
+    # Belief strength behind the prediction, from the rule's own history:
+    # support_count / (support_count + violation_count + 2.0). The gate uses
+    # this to stop acting on a rule that has been repeatedly disproven --
+    # previously confidence was computed and then read by nothing.
+    confidence: float = 1.0
 
 
 @dataclass

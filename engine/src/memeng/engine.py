@@ -69,6 +69,18 @@ class MemoryEngine:
             "tau_per_surprise": 1.0,      # H14/H15: tau advances on surprise only
             "induce_after": 3,            # H17: repeats needed to distill a rule
             "induce_top_assoc_min": 2,
+            # Which (antecedent, outcome) feature pair the rule channel
+            # predicts over. These are feature *keys*, not semantics: any
+            # deployment supplies its own recurring pair. Defaults preserve
+            # the historical mail behaviour.
+            "rule_antecedent": "subject_norm",
+            "rule_outcome": "sender",
+            # A rule whose confidence falls below this no longer votes on
+            # novelty. confidence = support/(support+violation+2), so a fresh
+            # rule sits at 0.5 and a disproven one decays toward 0. Rules
+            # below the floor are still fired and still graded, so one that
+            # starts matching again can climb back.
+            "rule_min_confidence": 0.05,
             "entity_extraction": True,
             "min_semantic_sim": 0.35,
         }
@@ -242,10 +254,17 @@ class MemoryEngine:
                 if actual_key_val_ok(actual_kv, av):
                     p = Prediction(source=str(rule["id"]),
                                    feature=rule["outcome_key"],
-                                   expected=rule["outcome_val"])
+                                   expected=rule["outcome_val"],
+                                   confidence=float(rule["confidence"]))
                     p.actual = (str(event.features[rule["outcome_key"]])
                                 if rule["outcome_key"] in event.features
                                 else None)
+                    # Unevaluable, not violated. A rule whose outcome feature
+                    # the event does not carry cannot be confirmed or
+                    # contradicted; scoring it a violation made rules induced
+                    # via the persons[] fallback unconfirmable by construction.
+                    if p.actual is None:
+                        continue
                     p.matched = (p.actual == str(p.expected))
                     predictions.append(p)
         self.tel.incr("predictions", len(predictions))
@@ -253,15 +272,23 @@ class MemoryEngine:
 
         # ---- GATE (H14 novelty / H18 gain / H16 arousal) ------------------
         with self.tel.stage("gate"):
-            violations = [p for p in predictions if p.matched is False]
-            if violations:
+            # Only rules still believed count toward novelty. A rule that has
+            # been disproven used to fire at full weight forever, contributing
+            # novelty=1.0 on every subsequent event -- it was computed, named,
+            # emitted in telemetry, and read by nothing. Rules below the floor
+            # are still fired and still graded (so a rule whose antecedent
+            # starts matching again can recover), they just do not get a vote.
+            trusted = [p for p in predictions
+                       if p.confidence >= cfg["rule_min_confidence"]]
+            violations = [p for p in trusted if p.matched is False]
+            if not predictions or not trusted:
+                novelty = 0.9          # nothing trustworthy predicted this
+            elif violations:
                 novelty = 1.0
-            elif not predictions:
-                novelty = 0.9
-            elif all(p.matched for p in predictions):
+            elif all(p.matched for p in trusted):
                 novelty = 0.05
             else:
-                novelty = 0.6
+                novelty = 0.6          # unreachable: see test_gate_no_partial_credit
 
             gains = [float((self.store.get_person(p) or
                             {"weight": 0.5})["weight"])
@@ -375,13 +402,20 @@ class MemoryEngine:
 
             bus.emit("schema_reinforced", tau_stream)
         # ---- H17 INDUCER: repetition -> causal-rule proposal -------
-        subj = event.features.get("subject_norm")
-        sender = (event.features.get("sender")
-                  or (event.persons[0] if event.persons else None))
+        # The (antecedent, outcome) pair is configuration, not mail. It was
+        # hardcoded to subject_norm -> sender, so the one predictive channel
+        # in a generic engine could not fire on any other kind of traffic.
+        ante_key = cfg["rule_antecedent"]
+        out_key = cfg["rule_outcome"]
+        subj = event.features.get(ante_key)
+        sender = event.features.get(out_key)
+        # Read from `features` only -- never from persons[]. The evaluator
+        # cannot see persons[], so a rule induced from it could never be
+        # confirmed: every firing was scored a violation.
         if subj and sender:
-            pair = f"subject_norm={subj}"
+            pair = f"{ante_key}={subj}"
             count, top_assoc, assoc_n =                         self.store.bump_cooccurrence(
-                    event.stream, pair, f"sender={sender}")
+                    event.stream, pair, f"{out_key}={sender}")
             if (count >= cfg["induce_after"]
                     and assoc_n >= cfg["induce_top_assoc_min"]):
                 rid = "ind-" + uuid.uuid5(
@@ -390,8 +424,8 @@ class MemoryEngine:
                 existed = any(r["id"] == rid for r in
                               self.store.active_rules(domain_id))
                 self.store.upsert_rule(
-                    domain_id, key="subject_norm", val=subj,
-                    outcome_key="sender",
+                    domain_id, key=ante_key, val=subj,
+                    outcome_key=out_key,
                     outcome_val=top_assoc.split("=", 1)[-1],
                     rule_id=rid)
                 if not existed:

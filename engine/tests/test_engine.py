@@ -296,3 +296,150 @@ def test_prune_decay_axis_wall_vs_tau():
     survivors = [r for r in s2.iter_episodes(level="event")]
     assert len(survivors) == 1 and survivors[0].persons == ["p_fresh"], \
         "2 wall-days old must survive wall-decay"
+
+
+# =====================================================================
+# Rule channel (measured 2026-09-30 against the email corpus; see
+# engine/RULE_CHANNEL.md). Each test fails without the fix it names.
+# =====================================================================
+
+
+# Finding 1 — a disproven rule must stop voting on novelty.
+# Before: confidence was computed, emitted in telemetry, and read by
+# nothing. A rule with confidence 0.000 kept firing and contributing
+# novelty=1.0 on every later event, forever.
+def test_disproven_rule_stops_voting_on_novelty():
+    # Point the inducer at a key no event carries, so it contributes no
+    # rules of its own and the seeded rule is the only one in play.
+    e, s = mk_engine(rule_antecedent="never_used")
+    rid = s.upsert_rule(domain_id=1, key="subject_norm", val="weekly report",
+                        outcome_key="sender", outcome_val="boss")
+
+    # One violation while still trusted -> maximally surprising.
+    r = e.new_event(ev(["p_other"], {"subject_norm": "weekly report",
+                                     "sender": "not-boss"}))
+    assert r.verdict.novelty == 1.0
+    assert r.predictions[0].confidence >= 0.05, "still trusted here"
+
+    for _ in range(200):
+        e.new_event(ev(["p_other"], {"subject_norm": "weekly report",
+                                     "sender": "not-boss"}))
+    rule = s.active_rules(1)[0]
+    assert rule["violation_count"] == 201
+    assert rule["confidence"] < 0.05, \
+        f"add-one smoothing should decay this far: {rule['confidence']}"
+
+    # Still fired and still graded -- it must be able to recover -- but it
+    # no longer contributes full-weight surprise.
+    r = e.new_event(ev(["p_other"], {"subject_norm": "weekly report",
+                                     "sender": "not-boss"}))
+    assert [p.source for p in r.predictions] == [rid], "still fired"
+    assert r.predictions[0].confidence < 0.05
+    assert r.verdict.novelty == 0.9, \
+        "a disproven rule must not claim an event was maximally surprising"
+
+
+# Finding 1 — a disproven rule that starts matching again must recover.
+def test_retired_rule_recovers_on_reconfirmation():
+    e, s = mk_engine(rule_antecedent="never_used")
+    s.upsert_rule(domain_id=1, key="subject_norm", val="weekly report",
+                  outcome_key="sender", outcome_val="boss")
+    for _ in range(200):
+        e.new_event(ev(["p_other"], {"subject_norm": "weekly report",
+                                     "sender": "not-boss"}))
+    below = s.active_rules(1)[0]["confidence"]
+    assert below < 0.05
+
+    for _ in range(10):
+        e.new_event(ev(["p_boss"], {"subject_norm": "weekly report",
+                                    "sender": "boss"}))
+    above = s.active_rules(1)[0]["confidence"]
+    assert above > below, "confidence must recover, or retirement is terminal"
+    r = e.new_event(ev(["p_boss"], {"subject_norm": "weekly report",
+                                    "sender": "boss"}))
+    assert r.verdict.novelty == 0.05, "trusted again -> routine again"
+
+
+# grade_rule computed confidence from pre-update counts, and gave a rule
+# with no evidence a confidence of 0.0 -- an unproven belief reading as
+# maximally distrusted. Both fixed by add-one smoothing evaluated on the
+# post-update row.
+def test_rule_confidence_is_smoothed_and_does_not_lag():
+    e, s = mk_engine()
+    rid = s.upsert_rule(domain_id=1, key="subject_norm", val="weekly report",
+                        outcome_key="sender", outcome_val="boss")
+    assert s.active_rules(1)[0]["confidence"] == 0.5, "no evidence = neutral"
+
+    row = s.grade_rule(rid, matched=True)
+    assert row["support_count"] == 1
+    assert math.isclose(row["confidence"], 2 / 3), \
+        f"should be (1+1)/(1+0+2) on the post-update row: {row['confidence']}"
+
+    row = s.grade_rule(rid, matched=False)
+    assert row["violation_count"] == 1
+    assert math.isclose(row["confidence"], 0.5), \
+        f"should be (1+1)/(1+1+2): {row['confidence']}"
+
+
+# Finding 6 — the inducer fell back to persons[] but the evaluator cannot
+# see persons[], so a rule induced that way could never be confirmed and
+# every firing scored a violation.
+def test_rule_is_not_induced_from_persons_alone():
+    e, s = mk_engine()
+    for _ in range(5):
+        e.new_event(ev(["p_boss"], {"subject_norm": "weekly report"}))
+    assert s.active_rules(1) == [], \
+        "sender absent from features: no rule should be induced"
+
+
+# A rule whose outcome feature an event does not carry is unevaluable, not
+# violated. Scoring it a violation is what made the above unconfirmable.
+def test_prediction_without_outcome_feature_is_unevaluable():
+    e, s = mk_engine()
+    s.upsert_rule(domain_id=1, key="subject_norm", val="weekly report",
+                  outcome_key="sender", outcome_val="boss")
+    r = e.new_event(ev(["p_boss"], {"subject_norm": "weekly report"}))
+    assert r.predictions == [], \
+        "cannot compare what the event does not carry"
+    assert r.verdict.novelty == 0.9, "unpredicted, not violated"
+    assert s.active_rules(1)[0]["violation_count"] == 0, \
+        "must not be graded on an unevaluable firing"
+
+
+# Finding 2 — the (antecedent, outcome) pair was hardcoded to mail.
+def test_rule_pair_is_configurable():
+    e, s = mk_engine(rule_antecedent="thread_id", rule_outcome="reply_to")
+    for _ in range(3):
+        e.new_event(ev(["p_a"], {"thread_id": "t-1", "reply_to": "p_b"}))
+    rules = s.active_rules(1)
+    assert len(rules) == 1
+    assert rules[0]["antecedent_key"] == "thread_id"
+    assert rules[0]["antecedent_val"] == "t-1"
+    assert rules[0]["outcome_key"] == "reply_to"
+    assert rules[0]["outcome_val"] == "p_b"
+
+
+# The default pair must not have moved.
+def test_default_rule_pair_is_unchanged():
+    e, s = mk_engine()
+    for _ in range(3):
+        e.new_event(ev(["p_boss"], {"subject_norm": "weekly report",
+                                    "sender": "boss"}))
+    rule = s.active_rules(1)[0]
+    assert (rule["antecedent_key"], rule["outcome_key"]) == ("subject_norm",
+                                                             "sender")
+
+
+# novelty=0.6 was an unreachable arm: `violations` non-empty and
+# `all(matched)` cannot both be false and true at once. Pinned so the
+# branch cannot start meaning something silently.
+def test_gate_no_partial_credit_branch_is_unreachable():
+    e, s = mk_engine()
+    s.upsert_rule(domain_id=1, key="subject_norm", val="v1",
+                  outcome_key="sender", outcome_val="boss")
+    s.upsert_rule(domain_id=1, key="subject_norm", val="v2",
+                  outcome_key="sender", outcome_val="boss")
+    # v1 will be violated, v2 will match: the mixed case 0.6 was meant for.
+    r = e.new_event(ev(["p_mix"], {"subject_norm": "v1", "sender": "nobody"}))
+    assert r.verdict.novelty == 1.0, "mixed match/violate -> 1.0, not 0.6"
+    assert r.verdict.novelty != 0.6
