@@ -54,7 +54,7 @@ def feed(e, n=3):
         e.new_event(Event(stream="mail:p1", kind="message",
                           wall=t0 + timedelta(minutes=i),
                           persons=["p_x"],
-                          features={"subject_norm": f"memo {i}",
+                          features={"subject_norm": f"alpha{i} beta{i} gamma{i}",
                                     "sender": "p_x"}))
 
 

@@ -34,6 +34,7 @@ import math
 import re
 import sqlite3
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -81,12 +82,32 @@ class MemoryEngine:
             # below the floor are still fired and still graded, so one that
             # starts matching again can climb back.
             "rule_min_confidence": 0.05,
+            # Second novelty source. When no rule fires, the engine used to
+            # invent surprise: "I have no prediction" was priced at 0.9, so a
+            # routine event was scored nearly maximal and nothing could lower
+            # it. Now it asks the content instead. Measured against the email
+            # corpus, a lifetime word-level test is useless -- vocabulary
+            # saturates and 74.6% of messages scored zero novel tokens -- so
+            # the window is RECENCY-weighted and bounded, which is also how
+            # `activate`'s own recency fallback already works.
+            "semantic_novelty": True,
+            "semantic_novelty_window": 64,
+            # Used when there is no content to compare (no terms, or an empty
+            # window). Matches the value this used to hardcode, so deployments
+            # without text see no behaviour change.
+            "semantic_novelty_fallback": 0.9,
             "entity_extraction": True,
             "min_semantic_sim": 0.35,
         }
         cfg.update(config or {})
         self.base_cfg = cfg
         self.tel = Telemetry()
+        # Term sets of recently ENCODED events, bounded and newest-last. This
+        # is the comparison set for semantic novelty: only events the engine
+        # chose to remember count as "already known", so novelty is measured
+        # against what is actually stored rather than against everything seen.
+        self._recent_terms: deque[frozenset] = deque(
+            maxlen=max(1, int(cfg["semantic_novelty_window"])))
 
         # ── retention profiles: application-controlled forgetting ─────────
         # Same brain hardware; the POLICY differs per deployment/domain.
@@ -281,8 +302,16 @@ class MemoryEngine:
             trusted = [p for p in predictions
                        if p.confidence >= cfg["rule_min_confidence"]]
             violations = [p for p in trusted if p.matched is False]
+            # Second novelty source. The rule channel has one opinion: did it
+            # predict this? When it has none, the engine used to INVENT
+            # surprise at 0.9 -- which priced every routine event whose subject
+            # never recurred as nearly maximal, and could not be lowered by
+            # anything. Now it asks the content instead. Adding this on top
+            # would have been inert (max(0.9, x) is 0.9); it has to REPLACE
+            # the invented value, which is why the branch moved.
+            sem = self._semantic_novelty(event)
             if not predictions or not trusted:
-                novelty = 0.9          # nothing trustworthy predicted this
+                novelty = sem          # was: 0.9
             elif violations:
                 novelty = 1.0
             elif all(p.matched for p in trusted):
@@ -352,6 +381,7 @@ class MemoryEngine:
                     is_anchor=is_anchor, features=dict(event.features))
                 self.store.insert_episode(rec, domain_id)
                 episode_id = rec.id
+                self._remember_terms(event)   # feed the novelty window
                 verdict.encoded = True
                 self.tel.incr("encoded")
                 # lexical + semantic indexing (FTS5 + optional embedder)
@@ -632,6 +662,61 @@ class MemoryEngine:
     def observe(self, event: Event, *,
                 handlers: dict | None = None) -> EventResult:
         return self.new_event(event, store=False, handlers=handlers)
+
+    # -----------------------------------------------------------------------
+    # Semantic novelty — the gate's second source (Finding 6, RULE_CHANNEL.md)
+    # -----------------------------------------------------------------------
+    def _content_terms(self, event: Event) -> frozenset:
+        """Content words of an event, for similarity against recent memory."""
+        parts = []
+        for key in ("subject_norm", "body_text", "text"):
+            v = event.features.get(key)
+            if isinstance(v, str) and v:
+                parts.append(v)
+        if not parts:
+            return frozenset()
+        return frozenset(
+            t for t in re.split(r"[^\w]+", " ".join(parts).lower())
+            # len>1 matches `activate`'s own tokenisation (engine.py:536),
+            # so the two paths agree on what a word is.
+            if len(t) > 1 and t not in self._FTS_STOP)
+
+    def _semantic_novelty(self, event: Event) -> float:
+        """How unlike anything already remembered is this event?
+
+        Jaccard overlap against a bounded, recency-weighted window of recently
+        ENCODED events. Chosen over the alternatives on measured grounds:
+
+        * word-level novelty against everything ever seen saturates -- the
+          corpus exhausted its vocabulary and 74.6% of messages scored zero
+          novel tokens;
+        * a vector search needs an embedder at gate time, which is the
+          expensive work the gate exists to avoid;
+        * FTS5 cannot return per-term hit counts cheaply, so it grades the
+          event into three buckets rather than continuously.
+
+        Returns 1.0 - best overlap: 1.0 means nothing similar is remembered.
+        """
+        cfg = self.base_cfg
+        if not cfg["semantic_novelty"]:
+            return float(cfg["semantic_novelty_fallback"])
+        terms = self._content_terms(event)
+        if not terms or not self._recent_terms:
+            return float(cfg["semantic_novelty_fallback"])
+        best = 0.0
+        for other in self._recent_terms:
+            inter = len(terms & other)
+            if inter:
+                best = max(best, inter / len(terms | other))
+        return 1.0 - best
+
+    def _remember_terms(self, event: Event) -> None:
+        """Add an encoded event to the novelty comparison window."""
+        if not self.base_cfg["semantic_novelty"]:
+            return
+        terms = self._content_terms(event)
+        if terms:
+            self._recent_terms.append(terms)
 
     def telemetry_report(self) -> dict:
         return self.tel.report()

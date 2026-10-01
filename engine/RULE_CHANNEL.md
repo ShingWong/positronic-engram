@@ -191,6 +191,72 @@ sets τ. Until the gate can say "this was routine and I did not predict it",
 τ will keep tracking message count, and any constant denominated in τ will keep
 encoding nothing.
 
+## Step 4: the gate now asks the content, and the gradient appears
+
+When no rule fires, the engine no longer invents surprise. It measures Jaccard
+overlap between the event's content terms and a bounded, recency-weighted
+window of **recently encoded** events, and uses `1 − best_overlap`.
+
+Measured on the full corpus, sender correctly placed:
+
+| arm | distinct novelty values | largest single value | τ/message | encode rate |
+|---|---|---|---|---|
+| raw, before | 3 | 83.3% | 0.8036 | 0.881 |
+| raw, after | ~130 | 20.2% | **0.6752** | **0.265** |
+| norm, before | 3 | 74.2% | 0.7788 | 0.846 |
+| norm, after | ~130 | 32.1% | **0.6530** | **0.385** |
+
+The three-value ladder is gone, and the difference between the two arms now
+reflects their content rather than the gate's constants.
+
+### Why Jaccard over a recent window, and not the alternatives
+
+Each was measured on the corpus first, because two earlier attempts at fixing
+this by regrading the existing signal failed:
+
+* **Word-level novelty against everything ever seen** saturates. A 19-year
+  corpus exhausts its vocabulary: **74.6% of messages scored zero novel
+  tokens**, and the largest single value did not improve. It is a *type*-level
+  test, and types run out.
+* **A vector search** needs an embedder at gate time — which is precisely the
+  expensive work the gate exists to avoid. Rejected on cost, not quality.
+* **FTS5** cannot return per-term hit counts cheaply, so it grades an event
+  into three buckets rather than continuously.
+* **A recency-weighted Jaccard window** is continuous, needs no embedder, and
+  is how `activate`'s own recency fallback already works.
+
+### Cost, honestly
+
+Measured directly rather than end-to-end, because end-to-end timing reported
+**−13.6%** — the feature is *faster* with the change, purely because fewer
+events encode and encoding is the expensive part. That masked the real number:
+
+```
+window= 16   26.7 us/event
+window= 32   45.9 us/event
+window= 64   75.3 us/event
+window=128  167.8 us/event
+window=256  221.9 us/event
+```
+
+Linear in window size. At the default of 64 this roughly doubles the gate's
+measured 43 µs — negligible against a 117 ms event, but it makes
+`semantic_novelty_window` a real cost knob, and `semantic_novelty: False`
+restores the old behaviour exactly.
+
+### The problem this creates, which is not yet fixed
+
+The encode rate collapsed from 0.85 to 0.27–0.39. Part of that is the feature
+working. The rest is that **`threshold` is no longer calibrated**: it was set
+when novelty was almost always 0.9 or 1.0, so `score = 0.5·novelty + 0.2·gain`
+sat at 0.55–0.70 and only just encoded. With mean novelty now 0.65, `score`
+sits near 0.425 and most events are suppressed.
+
+That is a threshold fitted to the old novelty distribution, not a new operating
+point chosen on purpose. Recalibrating `w_novelty` and `threshold` against the
+measured distribution is the next step, and it should be done deliberately
+rather than inherited.
+
 ## On calibrating anything in τ
 
 `OBJECT_SALIENCE.md` marks every τ constant uncalibrated, on the grounds that

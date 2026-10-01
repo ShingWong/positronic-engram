@@ -330,13 +330,69 @@ def test_disproven_rule_stops_voting_on_novelty():
         f"add-one smoothing should decay this far: {rule['confidence']}"
 
     # Still fired and still graded -- it must be able to recover -- but it
-    # no longer contributes full-weight surprise.
+    # no longer contributes full-weight surprise. The value is now the
+    # semantic term: 201 identical events are perfectly familiar, so the
+    # engine correctly says 0.0 rather than "maximally surprising".
     r = e.new_event(ev(["p_other"], {"subject_norm": "weekly report",
                                      "sender": "not-boss"}))
     assert [p.source for p in r.predictions] == [rid], "still fired"
     assert r.predictions[0].confidence < 0.05
-    assert r.verdict.novelty == 0.9, \
+    assert r.verdict.novelty != 1.0, \
         "a disproven rule must not claim an event was maximally surprising"
+    assert r.verdict.novelty == 0.0, \
+        "identical repeats are perfectly familiar content"
+
+
+# Finding 6 -- when no rule fires, the gate must ask the CONTENT rather than
+# inventing surprise. Before, "no rule fired" was hardcoded to 0.9, so a
+# routine event scored nearly maximal and nothing could lower it.
+def test_gate_asks_content_when_no_rule_fires():
+    e, s = mk_engine()
+    # Seed the window with an unrelated event so it is non-empty.
+    e.new_event(ev(["p_x"], {"subject_norm": "deployment pipeline rollback"}))
+    assert len(e._recent_terms) == 1, "encoded events feed the window"
+
+    # A near-duplicate of remembered content: no rule fires, but the content
+    # is familiar, so novelty must fall well below the old hardcoded 0.9.
+    dup = e.new_event(ev(["p_x"], {"subject_norm": "deployment pipeline rollback"}))
+    assert dup.predictions == [], "no rule, so the semantic term decides"
+    assert dup.verdict.novelty < 0.9
+    assert dup.verdict.encoded is False, "a duplicate need not be re-stored"
+
+    # Genuinely unfamiliar content: no rule fires, and nothing is similar.
+    new = e.new_event(ev(["p_y"], {"subject_norm": "kalamazoo trombone repair"}))
+    assert new.verdict.novelty > dup.verdict.novelty, \
+        "unfamiliar content must outrank a remembered duplicate"
+    assert new.verdict.encoded is True, "and should be worth storing"
+
+
+# With no comparable content the engine must behave exactly as before,
+# rather than inventing a surprise it cannot justify.
+def test_semantic_novelty_falls_back_without_content():
+    e, s = mk_engine()
+    e.new_event(ev(["p_x"], {"subject_norm": "rollback"}))
+    r = e.new_event(ev(["p_x"], {}))          # no text at all
+    assert r.verdict.novelty == 0.9, "fallback is the old hardcoded value"
+
+
+def test_semantic_novelty_can_be_disabled():
+    e, s = mk_engine(semantic_novelty=False)
+    e.new_event(ev(["p_x"], {"subject_norm": "alpha beta gamma"}))
+    r = e.new_event(ev(["p_x"], {"subject_norm": "alpha beta gamma"}))
+    assert r.verdict.novelty == 0.9, "disabled -> old behaviour exactly"
+
+
+# Only ENCODED events may feed the window, or novelty would be measured
+# against content the engine chose not to remember.
+def test_novelty_window_holds_only_encoded_events():
+    e, s = mk_engine()
+    before = len(e._recent_terms)
+    e.new_event(ev(["p_x"], {"subject_norm": "alpha beta gamma"}))
+    assert len(e._recent_terms) == before + 1, "first event encodes"
+    suppressed = e.new_event(ev(["p_x"], {"subject_norm": "alpha beta gamma"}))
+    if not suppressed.verdict.encoded:
+        assert len(e._recent_terms) == before + 1, \
+            "a suppressed event must not enter the window"
 
 
 # Finding 1 — a disproven rule that starts matching again must recover.
