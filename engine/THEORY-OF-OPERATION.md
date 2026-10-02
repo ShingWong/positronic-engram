@@ -599,8 +599,31 @@ Verified end to end on a live brain:
    prior in pure ingest. H18 learns from *retrieval*; a workload that never
    queries its own memory runs with the gain channel dead.
 
-5. **The cold start costs 1500 events.** Real, measured, and traded against
-   duplicate suppression rather than solved.
+5. **The cold start costs 1500 events, and that is a DURATION in
+   deployment, not a fixed annoyance.** `novelty_warmup` is an event
+   count, so the wall-clock blind spot is 1500 / event_rate. Measured rates:
+
+   | feed | measured rate | blind spot for 1500 events |
+   |---|---|---|
+   | mx1 mail log | 40/min (1.5M events over 26.2 days) | **38 minutes** |
+   | pvl visitor log | 175/day (331k over 5.19 years) | **8.6 days** |
+   | git commit subjects | 11.2/day (120k over 29.4 years) | **134 days** |
+
+   Note the ordering inverts against intuition: the corpus with the most
+   events has the *shortest* blind spot, because rate is what matters, not
+   volume. A deployment shaped like git -- a few real events a day, over
+   years -- spends **four months** unable to calibrate.
+
+   This is the highest-severity open issue for a slow feed, and it is easy
+   to miss because reporting it per-corpus in *events* makes it look
+   identical across all of them. Reporting it in *days* is what shows a
+   pvl-shaped deployment spending its first week blind.
+
+   Garbage collection removes the correctness cost -- the brain may open
+   freely and the copies are removed later, measured net 2 episodes from
+   5,880 admitted -- but it does not remove the fact that during warmup the
+   quantile path is not in service, so the store rate is whatever the
+   fallback cut allows rather than the calibrated 1 - q.
 
 6. **`w_arousal` and `burst_threshold` are untested.** Every corpus measured
    carries α = 0.
