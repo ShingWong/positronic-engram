@@ -1131,3 +1131,64 @@ def test_zero_warmup_does_not_crash_on_the_first_event():
                            wall=T0 + timedelta(seconds=1)))
         assert v.verdict.threshold >= 0.0, \
             "a degenerate warmup must fall back to the configured cut"
+
+
+@pytest.mark.skip(reason="known defect, measured, unfixed -- see "
+                       "engine/KNOWN_DEFECTS.md. The estimator's answer "
+                       "depends on unrelated memory.")
+def test_novelty_must_not_rise_as_the_window_fills_with_duplicates():
+    """The estimator's one unstated assumption. FAILS today, kept visible.
+
+    `_recent_terms` is assumed to hold a VARIETY of events. Nothing states
+    that and nothing verified it. Smoothed IDF is
+    log((n+1)/(df+1)) + 1, so an unseen term weighs log(n)+1 and grows
+    WITHOUT BOUND while a shared term saturates at 1.0. For
+    `alpha bravo charlie delta echo <i>` the similarity against a matching
+    entry is 5 / (5 + (log n + 1)^2), which collapses as n grows:
+
+        window  1     2     3     4     5     6 ...
+        novelty 0.272 0.383 0.455 0.506 0.544 0.574 ...
+
+    So a brain that remembers more of a repetitive stream decides each new
+    event is MORE novel, and duplicate suppression inverts.
+
+    The root cause is not the weighting, it is that df is computed over a
+    window containing the event's own near-duplicates. Isolated with a
+    FIXED event pair and window entries added that share nothing with it:
+
+        window size  1      5      9     13     21     37
+        novelty    0.2722 0.2155 0.2056 0.2010 0.1962 0.1920
+
+    A 41% change in an event's novelty from memory that has nothing to do
+    with it. No reweighting removes that, because the added entries change
+    df for the shared terms too. Measured and rejected: absolute IDF cap
+    (only 1.2 works, and that equalises all weights and so removes IDF
+    entirely), cap relative to the window median, giving unseen terms the
+    median weight, and computing the cosine over the intersection only
+    (degenerates to novelty 0.000 for every event, i.e. store everything).
+
+    Latent through the gate, because the gate stores so little that the
+    window stays near-empty on a repetitive stream. Live the moment the
+    gate is permissive enough to fill the window with copies -- proven by
+    A/B, since a median-based warmup cut alone takes 600 near-identical
+    events from 0.2% stored to 598/600.
+    """
+    e, _s = mk_engine()
+    e.register_domain("d", retention_profile="balanced")
+    e.attach_stream("d:s", "d")
+    words = "alpha bravo charlie delta echo".split()
+
+    def at(i):
+        return ev([f"p{i % 9}"],
+                  {"subject_norm": " ".join(words) + f" {i}",
+                   "body_text": " ".join(words) + f" {i}"}, wall=T0)
+
+    novelty = []
+    for i in range(12):
+        e._remember_terms(at(i))          # what a permissive gate does
+        v = e.new_event(at(1000 + i))
+        novelty.append(v.verdict.novelty)
+    assert novelty[-1] <= novelty[1] + 1e-6, (
+        f"novelty rose as the window filled with duplicates: "
+        f"{novelty[1]:.3f} -> {novelty[-1]:.3f}. Remembering more of a "
+        f"repetitive stream must not make it look less familiar.")
