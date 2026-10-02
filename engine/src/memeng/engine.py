@@ -940,7 +940,10 @@ class MemoryEngine:
         """
         cfg = self.base_cfg
         window = self._novelty_window
-        if len(window) < int(cfg["novelty_warmup"]):
+        # `not window` as well: with novelty_warmup <= 0 the comparison
+        # alone passes on the first event and the index below raises
+        # IndexError on an empty list.
+        if not window or len(window) < int(cfg["novelty_warmup"]):
             return float(fallback)
         q = float(cfg["novelty_quantile"])
         bar = window[min(len(window) - 1, int(q * (len(window) - 1)))]

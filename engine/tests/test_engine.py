@@ -1110,3 +1110,24 @@ def test_bar_on_a_point_mass_stops_discriminating():
     assert abs(rate2 - ceiling) < 0.05, (
         f"with the bar at the ceiling the rate should equal the ceiling "
         f"mass {ceiling:.1%}, got {rate2:.1%}")
+
+
+def test_zero_warmup_does_not_crash_on_the_first_event():
+    """novelty_warmup <= 0 used to raise IndexError immediately.
+
+    The guard was `len(window) < novelty_warmup`, which is False for an
+    empty window when warmup is 0, so the quantile index then ran against
+    an empty list. Found by sweeping the warmup down while measuring the
+    cold start -- a configuration nobody had set, reached by asking whether
+    the cold start was tunable.
+    """
+    for warm in (0, -5):
+        e, _s = mk_engine(novelty_warmup=warm)
+        e.register_domain("d", retention_profile="balanced")
+        e.attach_stream("d:s", "d")
+        from datetime import timedelta
+        v = e.new_event(ev(["p1"], {"subject_norm": "alpha topic",
+                                    "body_text": "beta body"},
+                           wall=T0 + timedelta(seconds=1)))
+        assert v.verdict.threshold >= 0.0, \
+            "a degenerate warmup must fall back to the configured cut"
