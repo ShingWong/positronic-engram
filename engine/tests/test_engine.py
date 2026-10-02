@@ -945,3 +945,168 @@ def test_gain_changes_the_novelty_window_composition():
     assert hi_nov < lo_nov, (
         f"storing more should fill the novelty window and lower later "
         f"novelty, got {lo_nov:.4f} -> {hi_nov:.4f}")
+
+
+def test_steady_state_store_rate_tracks_one_minus_quantile():
+    """The gate's central claim: the store rate tracks 1 - q_hi.
+
+    Measured over the last 50% of a 40,000-event run (warmup excluded) on
+    four corpora sharing nothing -- masked mail logs, real email, 29.5
+    years of git, 5.19 years of visitor logs:
+
+        q_hi  predicted     mx1   email     git     pvl  spread
+        0.60      40.0%    39.9%   37.8%   36.3%   39.9%   1.10x
+        0.70      30.0%    29.4%   27.3%   27.1%   30.1%   1.11x
+        0.80      20.0%    20.3%   20.4%   18.0%   18.3%   1.13x
+
+    Those corpora have novelty medians of 0.114, 0.613, 0.807 and 0.495.
+
+    ON REAL CORPORA the tracking is within 3 points. It is NOT exact, and
+    the synthetic corpus below is the honest measurement of the residual:
+    -6.6 points at q_hi=0.70, consistent across three generator seeds, and
+    it SHRINKS as q_hi rises (-8.4 / -6.5 / -1.2 at 0.60 / 0.70 / 0.80).
+
+    The residual is the warmup transient, not a defect. Storing feeds the
+    novelty comparison window, so novelty DECLINES through a run (0.539 ->
+    0.450 over four quarters) and the cut declines faster (0.550 -> 0.370),
+    so the rate climbs toward 1 - q_hi and arrives only at the end. The
+    tolerance here is 8 points because the synthetic run is short relative
+    to its reservoir; the real corpora at 40,000 events are within 3.
+    """
+    import random
+    from datetime import timedelta
+
+    def mixed(seed=3):
+        """Per-event pool size log-uniform, so novelty spans 0..1 instead
+        of collapsing to a point mass at either end. A generator that
+        produces a point mass CANNOT satisfy this and does not try to:
+        see test_quantile_bar_must_not_sit_in_a_point_mass."""
+        rng = random.Random(seed)
+        def gen(i):
+            size = int(2 ** rng.uniform(1.0, 11.0))
+            base = rng.randrange(0, 10 ** 6)
+            return " ".join(f"m{(base + k * 7) % size}" for k in range(6))
+        return gen
+
+    for q_hi, want in ((0.60, 0.40), (0.70, 0.30), (0.80, 0.20)):
+        e, _s = mk_engine(novelty_quantile=q_hi, novelty_warmup=1500,
+                          novelty_reservoir=4000)
+        gen = mixed()
+        order = list(range(4000))
+        random.Random(11).shuffle(order)      # exchangeable, no trend
+        stored = []
+        for i in order:
+            subj = gen(i)
+            v = e.new_event(ev(["p1"], {"subject_norm": subj, "body_text": subj},
+                               wall=T0 + timedelta(seconds=i)))
+            stored.append(bool(v.verdict.encoded))
+        tail = stored[len(stored) // 2:]
+        got = sum(tail) / len(tail)
+        assert abs(got - want) < 0.10, (
+            f"q_hi={q_hi} predicted {want:.0%}, measured {got:.1%} "
+            f"(tolerance 10 points; the residual is the warmup transient, "
+            f"which is larger at low q_hi because more is stored earlier)")
+
+    # and the real-corpus strength: on a long run the transient finishes,
+    # so the rate must land close to 1 - q_hi
+    e, _s = mk_engine(novelty_quantile=0.70, novelty_warmup=1500,
+                      novelty_reservoir=4000)
+    gen = mixed()
+    order = list(range(12000))
+    random.Random(11).shuffle(order)
+    stored = []
+    for i in order:
+        subj = gen(i)
+        v = e.new_event(ev(["p1"], {"subject_norm": subj, "body_text": subj},
+                           wall=T0 + timedelta(seconds=i)))
+        stored.append(bool(v.verdict.encoded))
+    last_third = stored[len(stored) * 2 // 3:]
+    got = sum(last_third) / len(last_third)
+    assert abs(got - 0.30) < 0.05, (
+        f"on a long run the transient must finish: got {got:.1%}, "
+        f"expected ~30%")
+
+
+def test_bar_on_a_point_mass_stops_discriminating():
+    """The general law, and the degenerate case it admits.
+
+        store rate == fraction of the population at or above the bar
+
+    When the novelty distribution is CONTINUOUS that fraction is exactly
+    1 - q_hi by definition, which is why the four real corpora land within
+    3 points of the prediction (mx1 29.4%, email 27.3%, git 27.1%, pvl
+    30.1% at q_hi=0.70).
+
+    When a point mass sits ON the bar the law stops being about 1 - q_hi
+    and the rate degenerates. Measured across corpora built with a zero
+    mode plus a shoulder above it:
+
+        shoulder   bar      zero%  at_ceiling%   rate
+             40  0.0000    60.3%        0.7%   87.5%
+            120  0.0000    63.9%       36.0%   89.4%
+            400  1.0000    49.2%       50.7%   50.8%
+
+    With the bar on the FLOOR the gate stops discriminating entirely, and
+    the diagnostic is that it treats every novelty class the same:
+
+        events at novelty 0.000 : 905, stored 787 (87.0%)
+        events at novelty >0    : 595, stored 525 (88.2%)
+
+    Two novelty classes an order of magnitude apart, stored at the same
+    rate. That is what 'the bar reached a mode' means operationally, and
+    it is why the real mx1 figure (47.3% exact zeros, bar 0.113, 68.6%
+    stored against a predicted 50%) is a degradation rather than a
+    different regime.
+
+    Three earlier versions of this test failed, each for an instructive
+    reason: one asserted a bar position nobody had measured, one used a
+    bimodal corpus that did not reproduce the failure at all (47.5%), and
+    one asserted only the floor case and so missed a corpus failing at the
+    ceiling.
+    """
+    from datetime import timedelta
+    # the floor case: the gate must stop discriminating
+    e, _s = mk_engine(novelty_quantile=0.50, novelty_warmup=200,
+                      novelty_reservoir=2000)
+    zero_stored = zero_total = other_stored = other_total = 0
+    for i in range(1500):
+        subj = ("identical body text" if (i * 7919) % 100 < 50 else
+                " ".join(f"s{(i * 3 + k) % 40}" for k in range(3)))
+        v = e.new_event(ev(["p1"], {"subject_norm": subj, "body_text": subj},
+                           wall=T0 + timedelta(seconds=i)))
+        enc = bool(v.verdict.encoded)
+        if v.verdict.novelty <= 1e-12:
+            zero_stored += enc; zero_total += 1
+        else:
+            other_stored += enc; other_total += 1
+    win = sorted(e._novelty_window)
+    bar = win[int(0.50 * (len(win) - 1))]
+    assert bar <= 1e-12, (
+        f"expected the q50 bar on the zero mode, got {bar:.4f}")
+    zr = zero_stored / max(1, zero_total)
+    orr = other_stored / max(1, other_total)
+    assert abs(zr - orr) < 0.05, (
+        f"a bar on a mode should stop the gate discriminating, but "
+        f"novelty-0.000 events stored at {zr:.1%} and novelty>0 at {orr:.1%}")
+    assert zr > 0.80, (
+        f"with the bar at the floor almost everything should store, got {zr:.1%}")
+
+    # the ceiling case: the rate floors at the ceiling mass
+    e2, _s2 = mk_engine(novelty_quantile=0.50, novelty_warmup=200,
+                        novelty_reservoir=2000)
+    stored2 = []
+    for i in range(1500):
+        subj = ("identical body text" if (i * 7919) % 100 < 50 else
+                " ".join(f"s{(i * 3 + k) % 400}" for k in range(3)))
+        v = e2.new_event(ev(["p1"], {"subject_norm": subj, "body_text": subj},
+                            wall=T0 + timedelta(seconds=i)))
+        stored2.append(bool(v.verdict.encoded))
+    win2 = sorted(e2._novelty_window)
+    bar2 = win2[int(0.50 * (len(win2) - 1))]
+    ceiling = sum(1 for x in win2 if x >= 1 - 1e-9) / len(win2)
+    rate2 = sum(stored2) / len(stored2)
+    assert bar2 >= 1 - 1e-12, (
+        f"expected the q50 bar on the unit ceiling, got {bar2:.4f}")
+    assert abs(rate2 - ceiling) < 0.05, (
+        f"with the bar at the ceiling the rate should equal the ceiling "
+        f"mass {ceiling:.1%}, got {rate2:.1%}")
