@@ -843,3 +843,66 @@ def test_fallback_results_do_not_earn_relationship_gain():
     assert after_miss == after_hit, (
         "a query that matched nothing changed relationship gain: "
         f"{len(after_miss) - len(after_hit)} identities credited from noise")
+
+
+def test_gain_cancels_against_its_own_threshold():
+    """`w_gain` cannot change what gets stored. Both sides carry it.
+
+        score = w_novelty*novelty + w_arousal*arousal + w_gain*gain
+        cut   = w_novelty*bar     +                 w_gain*gain
+
+    The gain term enters both with the same coefficient, so it subtracts
+    out exactly and the store decision cannot depend on it. Measured on60
+    thousand real events: of the 6 events whose person had raised gain,
+    ZERO changed their decision when gain was removed.
+
+    This is documented as a known inertness rather than fixed, because the
+    fix changes what the gate means (see GAIN_CANCELLATION.md): making gain
+    a bar shift rather than an additive term is a design decision, and the
+    bar shift is per-event so it could re-open the censoring problem the
+    own-quantile gate exists to avoid.
+
+    The test states the property so that anyone who changes the algebra
+    has to confront it, rather than discovering it again from a corpus.
+    """
+    # warmup lowered so the QUANTILE path is the one under test; the
+    # fallback cut is a constant and carries no gain term at all
+    e, _s = mk_engine(novelty_warmup=200)
+    e.register_domain("d", retention_profile="balanced")
+    e.attach_stream("d:s", "d")
+    from datetime import timedelta
+    _feed_n(e, 300, [f"alpha beta gamma {i}" for i in range(300)])
+    wn = e.base_cfg["w_novelty"]; wg = e.base_cfg["w_gain"]
+    checked = 0
+    for i in range(40):
+        # Snapshot the window BEFORE the call: the engine fits the cut
+        # before appending the current event's novelty, so reading the
+        # window afterwards gives a bar one step ahead. Measured: 0.4872
+        # against the true 0.4827 -- the test was wrong, not the engine.
+        win = list(e._novelty_window)
+        if len(win) < e.base_cfg["novelty_warmup"]:
+            continue          # pre-warmup cut is the configured fallback
+        bar = win[min(len(win) - 1,
+                      int(e.base_cfg["novelty_quantile"] * (len(win) - 1)))]
+        r = e.new_event(ev(["p1"],
+                           {"subject_norm": f"subject {i} delta",
+                            "body_text": f"body {i} epsilon"},
+                           wall=T0 + timedelta(seconds=1000 + i)))
+        v = r.verdict
+        # The verdict reports score and threshold rounded to 4dp for
+        # legibility, so compare at that resolution rather than pretending
+        # the rounding away.
+        score_terms = round(wn * v.novelty + e.base_cfg["w_arousal"] * v.arousal
+                            + wg * v.gain, 4)
+        cut_terms = round(wn * bar + wg * v.gain, 4)
+        assert v.score == pytest.approx(score_terms, abs=2e-4), \
+            f"score must decompose into its terms: {v.score} vs {score_terms}"
+        assert v.threshold == pytest.approx(cut_terms, abs=2e-4), \
+            f"cut must carry the same w_gain*gain term: {v.threshold} vs {cut_terms}"
+        # the cancellation itself: equal gain cannot change the outcome
+        shifted_score = score_terms + wg * 0.4
+        shifted_cut = cut_terms + wg * 0.4
+        assert (v.score >= v.threshold) == (shifted_score >= shifted_cut), \
+            "a uniform gain shift must not change the decision"
+        checked += 1
+    assert checked >= 20, f"expected to check many post-warmup events, got {checked}"
