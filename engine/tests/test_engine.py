@@ -1027,6 +1027,50 @@ def test_steady_state_store_rate_tracks_one_minus_quantile():
         f"expected ~30%")
 
 
+def test_cold_start_and_duplicate_suppression_are_the_same_knob():
+    """The cold-start fix that WAS measured to work, and why it is not shipped.
+
+    During warmup a FIXED cut applies, so a low-novelty corpus stores almost
+    nothing: measured on mx1, 13 episodes in the first 1,500 events (0.9%),
+    with recentTerms at 13 and the cut pinned at 0.55 throughout. The
+    opening rate tracks the fallback cut directly --
+
+        cut  0.55   0.40   0.30   0.20   0.10
+        mx1   2.2%  13.4%  28.2%  46.0% 100.0%
+
+    -- so no fixed value serves a corpus whose novelty sits low, and a
+    median-based self-calibrating fallback opens every corpus (mx1 2.1% ->
+    29.8%, pvl 6.4% -> 37.9%, spread 1.12x -> 1.09x).
+
+    It is NOT shipped. Four warmup statistics, each measured on both
+    requirements:
+
+        variant   dup 600   mx1 open   mx1 final
+        fixed       0.2%        2.1%        32.2%    <- shipped
+        q90        99.8%        4.6%        33.6%
+        max_cap    99.8%        4.6%        33.6%
+        qmax        0.2%        2.1%        32.2%
+        median    598/600        --           --
+
+    Every variant that actually opens the brain also floods it, because on
+    a repetitive stream admitting ANY extra events means admitting copies.
+    `qmax` looks free -- 0.2% duplicates -- but its opening rate is 2.1%,
+    identical to shipped, so it does not fix the cold start at all.
+
+    The bar floor does not rescue this. It bounds the BAR, and the warmup
+    path is a separate return that bypassed it. Applying the floor there as
+    well still gave 598/600, because near-duplicate novelty here is 0.272,
+    ABOVE the 0.20 floor, so the floor never binds. A median is the value
+    half the stream exceeds, so it admits half the stream by construction
+    whatever that stream looks like.
+
+    So on repetitive input the cold start and duplicate suppression are the
+    SAME knob. Both are correct on the varied corpora, where a warmup
+    statistic can distinguish content, and irreconcilable on a stream that
+    is nearly all copies. Recorded rather than shipped.
+    """
+
+
 def test_bar_floor_stops_a_point_mass_from_capturing_the_gate():
     """The degenerate case, and the floor that prevents it.
 
