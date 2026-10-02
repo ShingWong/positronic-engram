@@ -7,10 +7,28 @@ quietly dropped.
 
 ---
 
-## 1. Novelty depends on unrelated memory
+## 1. Novelty depends on unrelated memory -- noise filtering DECAYS
 
-**Status:** open. Pinned by
+**Status:** open, and the PRIMARY defect. Pinned by
 `test_novelty_must_not_rise_as_the_window_fills_with_duplicates` (skipped).
+
+**This is the main open failure, not a footnote.** Measured as store rate
+by decile of a 120,000-line run on the mx1 corpus:
+
+```
+service       d1    d2    d3    d4    d5    d6    d7    d8    d9   d10
+dnsblog     14%   13%   15%   13%   20%   49%   44%   73%   64%     -
+smtpd       11%   21%   22%   22%   10%    7%   22%   42%   40%   58%
+postscreen  21%   18%   20%   18%   29%   63%   54%   66%   69%   92%
+```
+
+The boilerplate services are stored MORE over time: `dnsblog` 14% -> 73%,
+`postscreen` 21% -> 92%. **Noise filtering decays as the brain fills up.**
+mx1 is a noise-filter corpus -- 66,260 dnsblog lines carrying 12 distinct
+strings -- so this is precisely what it exists to catch, and it is the only
+one of the four corpora with both a repetitive stream and enough length to
+show the drift. email, git and PVL have high-variance content, so their
+comparison windows stay varied and the defect never fires.
 
 ### The claim
 
@@ -47,11 +65,13 @@ novelty 0.272 0.383 0.455 0.506 0.544 0.574 0.618 0.650 0.674
 **A brain that remembers more of a repetitive stream decides each new event
 is more novel. Duplicate suppression inverts.**
 
-### Why it is latent on the shipped path
+### It is visible at run scale, and hidden at test scale
 
-The gate stores so little of a repetitive stream that `_recent_terms` stays
-near-empty, so `df` barely moves and the effect stays small. Verified by
-A/B on the shipped estimator: 0.2% of 600 near-identical events stored.
+Over a 600-event test the gate stores so little of a repetitive stream that
+`_recent_terms` stays near-empty, so `df` barely moves and the effect looks
+small (0.2% stored). Over a 120,000-line run the window fills with copies
+and the drift becomes the dominant behaviour. **A short test cannot see
+this failure; only a long repetitive corpus can.**
 
 It becomes live the moment the gate is permissive enough to fill the
 window with copies. Applying a median-based self-calibrating warmup cut —
