@@ -1310,3 +1310,54 @@ def test_dedup_runs_on_the_prune_pass():
         _seed(s, T0 + timedelta(seconds=i), ["p"], "repeat repeat repeat")
     rep = e.prune()
     assert rep.deduped == 19, f"prune() should dedup, got {rep.deduped}"
+
+
+def test_dedup_does_not_merge_the_same_words_years_apart():
+    """Same text + same actor is not automatically the same event.
+
+    Measured on git: 86 episodes merged where the wording recurred across up
+    to 3972 days, and one group collapsed 31 real commits into one --
+    including "initial revision" appearing in 1990 and again in 1995. Those
+    are different commits. Content+actor was not enough.
+
+    The asymmetry this encodes: a few extra duplicates is a cheap mistake,
+    a dropped fact is not. So merging requires proximity in TIME as well as
+    agreement on words and actor.
+    """
+    from datetime import timedelta
+    e, s = mk_engine(dedup_sim=0.6)
+    e.register_domain("d", retention_profile="balanced")
+    e.attach_stream("d:s", "d")
+    base = T0
+    # three occurrences of the same words, one per year
+    for year in (1990, 1991, 1992):
+        _seed(s, base.replace(year=year), ["git"], "initial revision",
+              tau=float(year - 1990))
+    assert len(_alive(s)) == 3
+    merged = e._dedup_pass()
+    assert merged == 0, (
+        f"same words years apart are separate commits, merged {merged}")
+    assert len(_alive(s)) == 3
+
+    # ...whereas within the span they ARE copies
+    e2, s2 = mk_engine(dedup_sim=0.6)
+    e2.register_domain("d", retention_profile="balanced")
+    e2.attach_stream("d:s", "d")
+    for i in range(5):
+        _seed(s2, base + timedelta(minutes=i), ["dnsblog"],
+              "warning: dnsblog reply timeout", tau=float(i))
+    assert e2._dedup_pass() == 4, "within the span, copies must collapse"
+    assert len(_alive(s2)) == 1
+
+
+def test_dedup_span_knob_is_honoured():
+    """The window is configurable, so a corpus with a different recurrence
+    horizon can be served without a code change."""
+    from datetime import timedelta
+    e, s = mk_engine(dedup_sim=0.6, dedup_span_seconds=60)
+    e.register_domain("d", retention_profile="balanced")
+    e.attach_stream("d:s", "d")
+    _seed(s, T0, ["p"], "recurring line", tau=0.0)
+    _seed(s, T0 + timedelta(minutes=5), ["p"], "recurring line", tau=1.0)
+    assert e._dedup_pass() == 0, "5 minutes apart exceeds a 60s span"
+    assert len(_alive(s)) == 2

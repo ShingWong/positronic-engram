@@ -169,6 +169,11 @@ class MemoryEngine:
             # distance, so this only bounds the near-duplicate remainder --
             # measured at 5.3% of mx1 against 94.1% exact. O(n*window).
             "dedup_window": 200,
+            # Beyond this gap, same text + same actor means a NEW event, not
+            # a copy. Chosen because it sits inside the observed gap
+            # distribution: mx1's duplicates are all within one hour, while
+            # git's recur across years.
+            "dedup_span_seconds": 86400,
             "novelty_warmup": 1500,
             # Absolute minimum for the derived bar. A quantile of a
             # distribution that has collapsed onto a point mass IS that
@@ -1042,6 +1047,11 @@ class MemoryEngine:
         Returns the number of episodes demoted.
         """
         window = max(1, int(self.base_cfg.get("dedup_window", 200)))
+        # Two events further apart than this are separate occurrences even
+        # when the words and the actor match. A day is the default: long
+        # enough to catch a log line repeated within an incident, short
+        # enough that "initial revision" in 1990 and 1995 stay distinct.
+        span = float(self.base_cfg.get("dedup_span_seconds", 86400))
         did = self.store.get_domain_id(domain) if domain else None
         # Per-EPISODE profile, not one profile for the sweep. Resolving a
         # single profile for the whole pass meant a caller that passed no
@@ -1065,27 +1075,47 @@ class MemoryEngine:
             terms = self._terms_of_episode(ep)
             if not terms:
                 continue
-            # Content AND actor. Content alone is wrong, measured: on pvl,
-            # 100% of same-text groups were a DIFFERENT person at a
-            # DIFFERENT time -- 6 appointments sharing text but involving 6
-            # distinct visitors. Two events are only redundant when the same
-            # words describe the same actor.
+            # Content, actor AND a separation test. Each of the first two
+            # was added because measurement demanded it, and the third for
+            # the same reason.
+            #
+            #   actor: content alone destroys records. On pvl, 100% of
+            #     same-text groups were a DIFFERENT person at a different
+            #     time -- 6 appointments sharing text, 6 distinct visitors.
+            #     Content-only merging destroyed 471 of them.
+            #
+            #   span: content+actor still drops facts. On git, 86 episodes
+            #     merged where the same text recurred across up to 3972
+            #     days; one group collapsed 31 real commits into one,
+            #     including "initial revision" appearing in 1990 and again
+            #     in 1995. Those are different commits.
+            #
+            # So two events merge only if they are close enough in time to
+            # be plausibly the SAME occurrence. Past `dedup_span_seconds`
+            # they are separate events that happen to share wording, and
+            # keeping them is right: a few more duplicates is the cheap
+            # mistake, a dropped fact is not.
             key = (terms, tuple(sorted(ep.persons or ())))
-            if key in seen:
+            wall = ep.wall.timestamp()
+            same_actor = any(r[1] == key[1] for r in recent)
+            close = recent and (wall - recent[-1][2]) <= span
+            if key in seen and not (same_actor and close):
+                dup = False                      # a distinct occurrence
+            elif key in seen:
                 dup = True
             else:
                 dup = any(
-                    other[0] == key[1]
-                    and len(key[0] & other[0]) >= thresh * (
-                        len(key[0]) + len(other[0]) - len(key[0] & other[0]))
-                    for other in recent)
+                    r[1] == key[1]
+                    and len(key[0] & r[0]) >= thresh * (
+                        len(key[0]) + len(r[0]) - len(key[0] & r[0]))
+                    for r in recent)
             if dup:
                 self.store.update_episode(str(ep.id), level="day_token",
                                           subject_norm=None)
                 merged += 1
             else:
                 seen.add(key)
-                recent.append(key)
+                recent.append((terms, key[1], wall))
         return merged
 
     @staticmethod

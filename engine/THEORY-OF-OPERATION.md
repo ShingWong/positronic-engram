@@ -342,12 +342,33 @@ recent episodes. A copy arriving more than 200 episodes later escapes.
 That is a real, unquantified gap.
 
 Two events are redundant only when the same words describe **the same
-actor**:
+actor, close enough in time to be the same occurrence**:
 
 ```
  key = ( content_terms , sorted(persons) )
- J(A,B) = |A ∩ B| / |A ∪ B|           redundant iff J ≥ dedup_sim  and  same actors
+
+ merge iff   key already seen
+        AND  same actors
+        AND  wall gap ≤ dedup_span_seconds
+        OR    J(terms, other terms) ≥ dedup_sim  within the recency window
 ```
+
+`dedup_span_seconds = 86400` (one day). All three conditions were added
+because measurement demanded them, and each was a real fact-dropping bug
+before it was fixed:
+
+- **actor** — content alone destroyed 471 pvl episodes.
+- **span** — content + actor still dropped facts. On git, 86 episodes merged
+  where the wording recurred across up to **3,972 days**, and one group
+  collapsed **31 real commits** into one, including `"initial revision"`
+  appearing in 1990 and again in 1995.
+
+The asymmetry this encodes is deliberate: **a few extra duplicates is the
+cheap mistake; a dropped fact is not.** Where the two conflict, keep both.
+
+The day-long span is chosen from the observed gap distribution — mx1's
+duplicates all fall within one hour, git's recur across years — so the
+default sits inside the gap rather than at a guess.
 
 `dedup_sim = 0.6`, from the retention profile so `archival` can set it to
 `None` and disable collection entirely.
@@ -359,12 +380,15 @@ merged **471** of them, destroying the record. Keying on content **and**
 actor merges **0**, while mx1 keeps its reclaim because its lines genuinely
 are one service emitting identical boilerplate with no distinct actor.
 
-| corpus | episodes kept | distinct | reclaimed |
-|---|---|---|---|
-| mx1 | 4,339 | 670 | 84.6% |
-| email | 5,545 | — | 11.5% |
-| git | 6,161 | — | 1.4% |
-| pvl | 4,159 | — | 0.0% |
+| corpus | episodes kept | merged | net | reclaimed |
+|---|---|---|---|---|
+| mx1 | 4,339 | 4,088 | 251 | 94.2% |
+| git | 6,161 | 94 | 6,067 | 1.5% |
+| pvl | 4,159 | 0 | 4,159 | 0.0% |
+
+mx1's reclaim went **up** after the span guard (84.6% → 94.2%), because
+within-hour duplicates still collapse freely. git barely moved, because its
+merges were precisely the year-spanning occurrences we now correctly keep.
 
 **Merge semantics reuse `prune_merge`'s vocabulary:** demote to `day_token`
 and clear `subject_norm`. A copy then occupies no search slot and **nothing
@@ -535,6 +559,7 @@ Verified end to end on a live brain:
 | `novelty_bar_floor` | 0.20 | minimum value for the derived bar | free below 0.348 (lowest varied bar); stops a point mass capturing the gate |
 | `novelty_warmup` | 1500 | events before the quantile is trusted | below this a quantile is not supportable |
 | `dedup_window` | 200 | near-duplicate comparison horizon | **known gap**: a copy arriving later than this escapes |
+| `dedup_span_seconds` | 86400 | beyond this gap, same words + same actor is a NEW event | sits inside the observed gap distribution: mx1 duplicates are all within 1h, git's recur across years |
 | `threshold` | 0.55 | the warmup fallback cut | not reachable for low-novelty corpora; the cold start, §4.4 |
 | `w_novelty` | 0.5 | novelty's share of score | |
 | `w_arousal` | 0.3 | arousal's share | never exercised — all corpora carry α = 0 |
@@ -597,8 +622,10 @@ Verified end to end on a live brain:
   the *oldest*, and the bias is invisible on short streams.
 - `w_gain·γ` must appear on **both** sides of the comparison, or gain
   becomes a score channel with no measured calibration.
-- Dedup keys on content **and** actor. Content alone destroys records of
-  genuinely distinct people doing the same thing.
+- Dedup keys on content, actor **and** a one-day proximity window. Content
+  alone destroys records of different people doing the same thing;
+  content+actor destroys records of the same words recurring years apart.
+  Where dropping a fact and keeping a duplicate are in tension, keep both.
 - Tokenisation must match `activate`'s, digits included.
 
 **Testing discipline that worked here:**
