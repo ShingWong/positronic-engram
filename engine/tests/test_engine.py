@@ -845,43 +845,43 @@ def test_fallback_results_do_not_earn_relationship_gain():
         f"{len(after_miss) - len(after_hit)} identities credited from noise")
 
 
-def test_gain_cancels_against_its_own_threshold():
-    """`w_gain` cannot change what gets stored. Both sides carry it.
+def test_gain_is_a_selection_channel_not_a_score_channel():
+    """`w_gain` cannot decide any single event, but it is not inert.
 
-        score = w_novelty*novelty + w_arousal*arousal + w_gain*gain
-        cut   = w_novelty*bar     +                 w_gain*gain
+    Per event the algebra cancels exactly -- `w_gain*gain` appears on both
+    sides of `score >= cut` with the same coefficient. Measured on one
+    event with the weight forced: margin is +0.0304 at gain 0.00, 0.25,
+    0.50, 0.75 and 1.00, and the implied bar is 0.9392 throughout.
 
-    The gain term enters both with the same coefficient, so it subtracts
-    out exactly and the store decision cannot depend on it. Measured on60
-    thousand real events: of the 6 events whose person had raised gain,
-    ZERO changed their decision when gain was removed.
+    It is NOT inert over a stream. `_remember_terms` feeds the novelty
+    comparison window only for STORED events (engine.py:542), so the store
+    decision changes which events enter the window, which changes every
+    later novelty value. Forcing gain over 8,000 commits:
 
-    This is documented as a known inertness rather than fixed, because the
-    fix changes what the gate means (see GAIN_CANCELLATION.md): making gain
-    a bar shift rather than an additive term is a design decision, and the
-    bar shift is per-event so it could re-open the censoring problem the
-    own-quantile gate exists to avoid.
+        forced gain   0.0     0.5     1.0
+        episodes    1,388   2,323   3,352     <- 2.4x
+        mean nov   0.8136  0.7814  0.7739    <- falls as more is stored
 
-    The test states the property so that anyone who changes the algebra
-    has to confront it, rather than discovering it again from a corpus.
+    So gain acts by SELECTION, not by score. That distinction is the
+    point: it means `w_gain` cannot be traded off against `w_novelty` as
+    if they were two terms in one inequality, and it means the invariant
+    below is per event only.
     """
-    # warmup lowered so the QUANTILE path is the one under test; the
-    # fallback cut is a constant and carries no gain term at all
     e, _s = mk_engine(novelty_warmup=200)
     e.register_domain("d", retention_profile="balanced")
     e.attach_stream("d:s", "d")
     from datetime import timedelta
+
+    # snapshot the window BEFORE the call: the engine fits the cut before
+    # appending this event's novelty, so reading it afterwards gives a bar
+    # one step ahead (0.4872 against the true 0.4827).
+    win = list(e._novelty_window)
     _feed_n(e, 300, [f"alpha beta gamma {i}" for i in range(300)])
-    wn = e.base_cfg["w_novelty"]; wg = e.base_cfg["w_gain"]
     checked = 0
     for i in range(40):
-        # Snapshot the window BEFORE the call: the engine fits the cut
-        # before appending the current event's novelty, so reading the
-        # window afterwards gives a bar one step ahead. Measured: 0.4872
-        # against the true 0.4827 -- the test was wrong, not the engine.
         win = list(e._novelty_window)
         if len(win) < e.base_cfg["novelty_warmup"]:
-            continue          # pre-warmup cut is the configured fallback
+            continue
         bar = win[min(len(win) - 1,
                       int(e.base_cfg["novelty_quantile"] * (len(win) - 1)))]
         r = e.new_event(ev(["p1"],
@@ -889,9 +889,7 @@ def test_gain_cancels_against_its_own_threshold():
                             "body_text": f"body {i} epsilon"},
                            wall=T0 + timedelta(seconds=1000 + i)))
         v = r.verdict
-        # The verdict reports score and threshold rounded to 4dp for
-        # legibility, so compare at that resolution rather than pretending
-        # the rounding away.
+        wn = e.base_cfg["w_novelty"]; wg = e.base_cfg["w_gain"]
         score_terms = round(wn * v.novelty + e.base_cfg["w_arousal"] * v.arousal
                             + wg * v.gain, 4)
         cut_terms = round(wn * bar + wg * v.gain, 4)
@@ -899,10 +897,51 @@ def test_gain_cancels_against_its_own_threshold():
             f"score must decompose into its terms: {v.score} vs {score_terms}"
         assert v.threshold == pytest.approx(cut_terms, abs=2e-4), \
             f"cut must carry the same w_gain*gain term: {v.threshold} vs {cut_terms}"
-        # the cancellation itself: equal gain cannot change the outcome
-        shifted_score = score_terms + wg * 0.4
-        shifted_cut = cut_terms + wg * 0.4
-        assert (v.score >= v.threshold) == (shifted_score >= shifted_cut), \
+        # THE per-event invariant: a uniform gain shift cannot flip a
+        # decision, because both sides move together.
+        shifted = wg * 0.4
+        assert (v.score >= v.threshold) == \
+            (v.score + shifted >= v.threshold + shifted), \
             "a uniform gain shift must not change the decision"
         checked += 1
     assert checked >= 20, f"expected to check many post-warmup events, got {checked}"
+
+
+def test_gain_changes_the_novelty_window_composition():
+    """The other half of the same finding: gain acts by selection.
+
+    Storing more feeds `_recent_terms` with more stored events, so later
+    events measure as less novel and fewer are stored. Measured over 8,000
+    git commits with the person weight forced: episodes 1,388 / 2,323 /
+    3,352 at gain 0.0 / 0.5 / 1.0, with mean novelty falling 0.8136 ->
+    0.7739. Without this, `w_gain` reads as an inert knob, which is what
+    two earlier sessions concluded from single-event evidence.
+    """
+    from datetime import timedelta
+    out = {}
+    for w in (0.0, 1.0):
+        e, s = mk_engine()
+        e.register_domain("d", retention_profile="balanced")
+        e.attach_stream("d:s", "d")
+        novs = []
+        for i in range(600):
+            if i % 20 == 0:
+                s.conn.execute(
+                    "INSERT INTO person(pid,weight) VALUES('p1',?) "
+                    "ON CONFLICT(pid) DO UPDATE SET weight=excluded.weight",
+                    (w,))
+                s._person_cache.pop("p1", None)
+            v = e.new_event(ev(["p1"],
+                               {"subject_norm": f"topic {i} alpha beta",
+                                "body_text": f"body {i} gamma delta"},
+                               wall=T0 + timedelta(seconds=i)))
+            novs.append(v.verdict.novelty)
+        out[w] = (s.count_episodes(), sum(novs) / len(novs))
+    lo_eps, lo_nov = out[0.0]
+    hi_eps, hi_nov = out[1.0]
+    assert hi_eps > lo_eps * 1.2, (
+        f"raising gain should store more via selection, got "
+        f"{lo_eps} -> {hi_eps} episodes")
+    assert hi_nov < lo_nov, (
+        f"storing more should fill the novelty window and lower later "
+        f"novelty, got {lo_nov:.4f} -> {hi_nov:.4f}")
