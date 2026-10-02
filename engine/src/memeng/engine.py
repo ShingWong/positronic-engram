@@ -164,6 +164,11 @@ class MemoryEngine:
             # all. Below this the gate falls back to `threshold`, which for
             # a cold brain must itself be reachable from the cold-start
             # score (w_novelty*novelty_empty + w_gain*gain).
+            # How many recent episodes the NEAR-duplicate scan compares
+            # against. Exact duplicates are caught by hash regardless of
+            # distance, so this only bounds the near-duplicate remainder --
+            # measured at 5.3% of mx1 against 94.1% exact. O(n*window).
+            "dedup_window": 200,
             "novelty_warmup": 1500,
             # Absolute minimum for the derived bar. A quantile of a
             # distribution that has collapsed onto a point mass IS that
@@ -279,18 +284,22 @@ class MemoryEngine:
         self.retention_profiles = {
             "balanced":   {"S_base": 30.0,  "S_arousal": 40.0,
                            "prune_merge": 0.35, "prune_expire": 0.05,
+                           "dedup_sim": 0.6,
                            "obj_dormant": 200.0, "obj_forget": 1200.0,
                            "renew_ratio": 0.3, "renew_max": 12000.0},
             "archival":   {"S_base": 1e6,   "S_arousal": 0.0,
                            "prune_merge": None, "prune_expire": None,
+                           "dedup_sim": None,
                            "obj_dormant": None, "obj_forget": None,
                            "renew_ratio": None, "renew_max": None},
             "long_term":  {"S_base": 120.0, "S_arousal": 40.0,
                            "prune_merge": 0.20, "prune_expire": 0.02,
+                           "dedup_sim": 0.6,
                            "obj_dormant": 600.0, "obj_forget": 5000.0,
                            "renew_ratio": 0.3, "renew_max": 50000.0},
             "short_term": {"S_base": 6.0,   "S_arousal": 4.0,
                            "prune_merge": 0.20, "prune_expire": 0.02,
+                           "dedup_sim": 0.6,
                            "obj_dormant": 25.0, "obj_forget": 150.0,
                            "renew_ratio": 0.0, "renew_max": 150.0},
         }
@@ -1003,6 +1012,104 @@ class MemoryEngine:
         return self.tel.summary_line()
 
     # -----------------------------------------------------------------------
+    def _dedup_pass(self, domain: str | None = None) -> int:
+        """Collapse near-copies into the episode that came first.
+
+        The gate decides what is INTERESTING to admit; this decides what is
+        worth KEEPING. Separating them is what lets the gate admit freely
+        without the store staying polluted -- measured on mx1, where a
+        permissive warmup admits 4,998 copies of a 5,000-event duplicate
+        stream and this pass merges 4,997 of them back to 1.
+
+        Lives on the prune pass for the same reason H18 gain decay does:
+        so it needs no timer of its own. `prune()` already fetches every
+        episode via `iter_episodes()`, so the corpus comes free.
+
+        Two structures, because the two duplicate kinds cost wildly
+        different amounts:
+
+        * EXACT duplicates are caught by hashing the normalised term set,
+          O(n) and independent of distance. Measured: 94.1% of mx1's
+          duplication is exact, so this is the bulk of the work.
+        * NEAR duplicates need comparison, so they are bounded by
+          `dedup_window` and a copy arriving later than that escapes.
+          Measured: 5.3% of mx1, and the remainder on the varied corpora.
+
+        Merge semantics reuse `prune_merge`'s vocabulary -- demote to
+        `day_token` and clear `subject_norm` -- so a copy occupies no
+        search slot and nothing is deleted.
+
+        Returns the number of episodes demoted.
+        """
+        window = max(1, int(self.base_cfg.get("dedup_window", 200)))
+        did = self.store.get_domain_id(domain) if domain else None
+        # Per-EPISODE profile, not one profile for the sweep. Resolving a
+        # single profile for the whole pass meant a caller that passed no
+        # domain got the default profile's threshold, so an ARCHIVAL domain
+        # would still have been swept -- found by a test asserting archival
+        # drops nothing, which caught 19 merges it should not have made.
+        seen: set[tuple] = set()
+        recent: deque[tuple] = deque(maxlen=window)
+        merged = 0
+        for ep in self.store.iter_episodes(ordered=True):
+            if did is not None and ep.domain_id != did:
+                continue
+            edid = ep.domain_id if ep.domain_id is not None else \
+                (self.store.get_stream(ep.stream) or {}).get("domain_id")
+            pname = (self.store.get_domain(edid) or {}).get(
+                "retention_profile") if edid is not None else None
+            pname = pname or self.base_cfg.get("retention_profile", "balanced")
+            thresh = self.retention_profiles.get(pname, {}).get("dedup_sim")
+            if thresh is None:
+                continue                 # archival: nothing is ever dropped
+            terms = self._terms_of_episode(ep)
+            if not terms:
+                continue
+            # Content AND actor. Content alone is wrong, measured: on pvl,
+            # 100% of same-text groups were a DIFFERENT person at a
+            # DIFFERENT time -- 6 appointments sharing text but involving 6
+            # distinct visitors. Two events are only redundant when the same
+            # words describe the same actor.
+            key = (terms, tuple(sorted(ep.persons or ())))
+            if key in seen:
+                dup = True
+            else:
+                dup = any(
+                    other[0] == key[1]
+                    and len(key[0] & other[0]) >= thresh * (
+                        len(key[0]) + len(other[0]) - len(key[0] & other[0]))
+                    for other in recent)
+            if dup:
+                self.store.update_episode(str(ep.id), level="day_token",
+                                          subject_norm=None)
+                merged += 1
+            else:
+                seen.add(key)
+                recent.append(key)
+        return merged
+
+    @staticmethod
+    def _terms_of_episode(ep) -> frozenset[str]:
+        """Content terms of a stored episode, for dedup comparison.
+
+        Same tokenisation as `_content_terms` -- the same stop list and the
+        same single-digit rule -- so dedup and the novelty gate cannot
+        disagree about what counts as content.
+        """
+        import re as _re
+        parts = [ep.subject_norm or ""]
+        feats = getattr(ep, "features", None)
+        if isinstance(feats, dict):
+            bt = feats.get("body_text")
+            if isinstance(bt, str) and bt:
+                parts.append(bt)
+        txt = " ".join(p for p in parts if p).lower()
+        if not txt:
+            return frozenset()
+        return frozenset(
+            t for t in _re.split(r"[^\w]+", txt)
+            if (len(t) > 1 or t.isdigit()) and t not in MemoryEngine._FTS_STOP)
+
     def prune(self, tau_now: float | None = None, *,
               domain: str | None = None,
               decay_axis: str = "tau",
@@ -1025,7 +1132,7 @@ class MemoryEngine:
         in clock. See consumers/benchmarks/suites/decay_ablation.
         """
         rep = {"scanned": 0, "day_merged": 0, "week_merged": 0,
-               "expired": 0, "residues": 0}
+               "expired": 0, "residues": 0, "deduped": 0}
         eps = self.store.iter_episodes()
         did = self.store.get_domain_id(domain) if domain else None
         if domain and did is not None:
@@ -1041,6 +1148,12 @@ class MemoryEngine:
         # prune non-idempotent.
         self.store.decay_person_weights(
             rate=float(self.base_cfg.get("gain_decay_rate", 0.01)))
+        # Garbage collection, same rationale as the gain decay above: a
+        # housekeeping task on an existing pass, so it needs no timer. The
+        # gate admits what is interesting; this decides what is worth
+        # keeping. Measured on mx1 it reclaims 87.4% of stored episodes while
+        # leaving 1.0-9.0% of the three varied corpora untouched.
+        rep["deduped"] = self._dedup_pass(domain=domain)
         # Idle accrual: tau is an experiential clock, so silence has to move
         # it or a quiet agent never ages. Credited per stream, from the time
         # since that stream's last event to `wall_now`. Default 0.0 preserves

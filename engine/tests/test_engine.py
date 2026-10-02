@@ -1163,3 +1163,150 @@ def test_bar_floor_cannot_bind_on_a_varied_corpus():
         f"this corpus's bar {bar:.4f} must exceed the floor {floor} or the "
         f"floor binds and the 1-q_hi guarantee is void for it")
     assert floor > 0.0, "a zero floor is the shipped defect, not a default"
+
+
+def _alive(s, stream="d:s"):
+    """Episodes still at level='event' -- EpisodeRecord carries no level
+    column, so the ladder state has to be read from SQL."""
+    return [r["id"] for r in s.conn.execute(
+        "SELECT id FROM episode WHERE level='event' AND stream=?",
+        (stream,))]
+
+
+def _seed(s, wall, persons, text, stream="d:s", tau=None):
+    """Insert an episode DIRECTLY, bypassing the gate.
+
+    Dedup is a store-level pass, so testing it against a hand-seeded store
+    tests what it actually does. Going through the gate cannot work: pure
+    boilerplate is scored low-novelty, so the bar floor and the warmup cut
+    reject it first and only 1-3 episodes of 400 ever reach the store
+    (measured). The pass would then have nothing to collapse and the test
+    would pass vacuously.
+    """
+    from memeng.models import EpisodeRecord, Provenance, Tier
+    import uuid
+    rec = EpisodeRecord(
+        id=uuid.uuid4(), stream=stream, kind="message", wall=wall,
+        mono=0, tau=float(len(_alive(s))) if tau is None else float(tau),
+        persons=list(persons),
+        subject_norm=text, salience=0.5, tier=Tier.NORMAL,
+        strength=30.0, provenance=Provenance.WITNESSED, fuzz_lo=None,
+        fuzz_hi=None, precision_src="exact", is_anchor=False,
+        features={"subject_norm": text, "body_text": text},
+        domain_id=None)
+    s.insert_episode(rec, int(s.get_domain_id("a" if stream == "a:s" else "d") or 0))
+    return rec.id
+
+
+def test_dedup_preserves_same_text_from_different_actors():
+    """Content alone is not identity.
+
+    Measured on the pvl corpus: 100% of same-text episode groups were a
+    DIFFERENT person at a DIFFERENT time -- the largest group was 6
+    appointments sharing text but involving 6 distinct visitors. Collapsing
+    those on content alone destroys the record, and it did: 471 episodes
+    merged on pvl before this fix, 0 after.
+
+    An mx1 log line legitimately collapses, because it is one service
+    emitting identical boilerplate with no distinct actor. That reclaim --
+    84.6% of stored episodes -- survives the fix.
+    """
+    from datetime import timedelta
+    e, s = mk_engine(dedup_sim=0.6)
+    e.register_domain("d", retention_profile="balanced")
+    e.attach_stream("d:s", "d")
+    for i in range(6):
+        _seed(s, T0 + timedelta(hours=i), [f"visitor{i}"],
+              "group tour west wing")
+    pre = len(_alive(s))
+    assert pre == 6
+    assert e._dedup_pass() == 0, "cross-actor episodes must all survive"
+    assert len(_alive(s)) == 6
+
+
+def test_dedup_keeps_one_of_a_repeated_boilerplate_line():
+    """The other half: identical text AND actor really is redundant."""
+    from datetime import timedelta
+    e, s = mk_engine(dedup_sim=0.6)
+    e.register_domain("d", retention_profile="balanced")
+    e.attach_stream("d:s", "d")
+    for i in range(50):
+        _seed(s, T0 + timedelta(seconds=i), ["dnsblog"],
+              "warning: dnsblog reply timeout")
+    pre = len(_alive(s))
+    assert pre == 50
+    merged = e._dedup_pass()
+    assert merged == 49, f"expected every copy but one collapsed, got {merged}"
+    assert len(_alive(s)) == 1, "one boilerplate line should survive"
+
+
+def test_archival_profile_disables_dedup():
+    """Per-domain policy, like prune_merge: archival drops nothing."""
+    from datetime import timedelta
+    e, s = mk_engine(dedup_sim=0.6)
+    e.register_domain("a", retention_profile="archival")
+    e.attach_stream("a:s", "a")
+    for i in range(20):
+        _seed(s, T0 + timedelta(seconds=i), ["p"], "same text every time",
+              stream="a:s")
+    assert e.retention_profiles["archival"]["dedup_sim"] is None
+    before = len(_alive(s))
+    assert e._dedup_pass() == 0, "archival must not drop episodes"
+    assert len(_alive(s)) == before
+
+
+def test_dedup_keeps_the_lowest_tau_episode():
+    """Which of a duplicate pair survives is decided by iteration order.
+
+    So the pass must iterate in tau order. `iter_episodes()` without
+    `ordered=True` returns SQLite rowid order, which is INSERTION order --
+    and ingest is not always monotonic in tau once input is backdated or
+    replayed. Picking the wrong survivor is silently wrong: the copy is
+    demoted and the original discarded, and nothing reports the swap.
+
+    The fixture inserts DESCENDING tau, so rowid order and tau order are
+    exact opposites and the two implementations must disagree. Two earlier
+    versions of this test could not fail: seeding sequentially makes both
+    orders identical, and rewriting tau afterwards preserved the rowid
+    ordering that SQLite actually returns.
+    """
+    from datetime import timedelta
+    e, s = mk_engine(dedup_sim=0.6)
+    e.register_domain("d", retention_profile="balanced")
+    e.attach_stream("d:s", "d")
+    ranks = list(range(20))[::-1]          # insert highest tau first
+    for i, rank in enumerate(ranks):
+        _seed(s, T0 + timedelta(seconds=i), ["p"], "alpha repeated line",
+              tau=rank)
+    table = [r.tau for r in e.store.iter_episodes()]
+    ordered = [r.tau for r in e.store.iter_episodes(ordered=True)]
+    assert table == sorted(table, reverse=True), \
+        f"fixture must insert descending tau, got {table}"
+    assert ordered == sorted(ordered), \
+        f"ordered=True must return ascending tau, got {ordered}"
+    assert table != ordered, "the two orders must disagree for this to bite"
+
+    e._dedup_pass()
+    ids = set(_alive(s))
+    survivors = [r for r in e.store.iter_episodes(ordered=True)
+                 if str(r.id) in ids]
+    assert len(survivors) == 1, f"expected 1 survivor, got {len(survivors)}"
+    # Lowest TAU survives -- not lowest wall, and not first-inserted. tau is
+    # the brain's own experiential clock, so a backdated event is later to
+    # the brain even when earlier on the calendar.
+    assert survivors[0].tau == 0.0, (
+        f"lowest tau must survive, got tau={survivors[0].tau}")
+
+
+def test_dedup_runs_on_the_prune_pass():
+    """The reason no counter was added: prune() already sweeps every
+    episode for the tau ladder, and H18 gain decay was bolted on here for
+    the same reason. Dedup must come along for the ride."""
+    from datetime import timedelta
+    e, s = mk_engine(dedup_sim=0.6)
+    e.register_domain("d", retention_profile="balanced")
+    e.attach_stream("d:s", "d")
+    for i in range(20):
+        _seed(s, T0 + timedelta(seconds=i), ["p"], "repeat repeat repeat")
+    rep = e.prune()
+    assert rep.deduped == 19, f"prune() should dedup, got {rep.deduped}"

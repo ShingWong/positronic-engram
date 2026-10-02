@@ -544,9 +544,21 @@ class SQLiteStore:
             features=json.loads(r["features_json"]))
 
 
-    def iter_episodes(self, level: str = "event") -> list[EpisodeRecord]:
-        rows = self.conn.execute("SELECT * FROM episode WHERE level=?",
-                                 (level,)).fetchall()
+    def iter_episodes(self, level: str = "event", *,
+                      ordered: bool = False) -> list[EpisodeRecord]:
+        """Episodes at `level`, optionally in tau order.
+
+        `ordered=True` matters for any pass where one episode must be judged
+        against an EARLIER one -- dedup keeps the original and demotes the
+        copy, so which of a pair survives is decided by order. Table order
+        is insertion order in practice, which is not tau order once
+        backdated or replayed input arrives, and picking the wrong survivor
+        is silently wrong rather than loudly wrong.
+        """
+        sql = "SELECT * FROM episode WHERE level=?"
+        if ordered:
+            sql += " ORDER BY tau, wall"
+        rows = self.conn.execute(sql, (level,)).fetchall()
         out = []
         for r in rows:
             out.append(EpisodeRecord(

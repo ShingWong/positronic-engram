@@ -143,6 +143,10 @@ class PruneReport:
     week_merged: int
     expired: int
     residues: int = 0
+    # Episodes demoted by the garbage-collection pass: near-copies collapsed
+    # into the episode that came first. Separate from day_merged because it
+    # is a CONTENT decision, not an age one.
+    deduped: int = 0
     objects_dormant: int = 0
     objects_forgotten: int = 0
     objects_renewed: int = 0
