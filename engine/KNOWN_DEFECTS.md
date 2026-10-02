@@ -9,26 +9,35 @@ quietly dropped.
 
 ## 1. Novelty depends on unrelated memory -- noise filtering DECAYS
 
-**Status:** open, and the PRIMARY defect. Pinned by
+**Status:** latent at run scale on all four corpora; FIXED as a run-scale
+failure by the bar floor (`novelty_bar_floor`, commit 171750e). Pinned by
 `test_novelty_must_not_rise_as_the_window_fills_with_duplicates` (skipped).
 
-**This is the main open failure, not a footnote.** Measured as store rate
-by decile of a 120,000-line run on the mx1 corpus:
+**Correction to an earlier claim in this file.** The decile table below was
+read as the IDF inversion driving noise-filter decay. That attribution was
+wrong. Re-measured with the floor in place, over 300,000 mx1 lines:
 
 ```
-service       d1    d2    d3    d4    d5    d6    d7    d8    d9   d10
-dnsblog     14%   13%   15%   13%   20%   49%   44%   73%   64%     -
-smtpd       11%   21%   22%   22%   10%    7%   22%   42%   40%   58%
-postscreen  21%   18%   20%   18%   29%   63%   54%   66%   69%   92%
+  corpus  store rate by decile (floor ON)              drift d1->d10  d2->d10
+  mx1     24% 29% 24% 22% 19% 18% 16% 17% 17% 26%        +1.4%        -3.2%
+  pvl     15% 29% 31% 28% 30% 29% 28% 29% 29% 29%       +14.3%        +0.1%
+  git     30% 29% 28% 28% 32% 28% 28% 29% 30% 30%        -0.3%        -0.3%
+  email   35% 31% 33% 34% 31% 24% 27% 27% 28% 30%        -4.7%        -4.7%
 ```
 
-The boilerplate services are stored MORE over time: `dnsblog` 14% -> 73%,
-`postscreen` 21% -> 92%. **Noise filtering decays as the brain fills up.**
-mx1 is a noise-filter corpus -- 66,260 dnsblog lines carrying 12 distinct
-strings -- so this is precisely what it exists to catch, and it is the only
-one of the four corpora with both a repetitive stream and enough length to
-show the drift. email, git and PVL have high-variance content, so their
-comparison windows stay varied and the defect never fires.
+**No bar rises on any corpus** (mean cut d2->d10: mx1 -0.037, pvl -0.001,
+git -0.036, email -0.122). PVL's apparent decay is the cold start alone --
+decile 1 is 15%, deciles 2-10 are flat at 28-31%. So the inversion does not
+produce drift at run scale on any real corpus measured.
+
+What the decile table actually showed was the BAR COLLAPSING, not rising:
+dnsblog's novelty is 98.3% exactly 0.000, so the q70 quantile is zero, the
+cut floors at `w_gain*gain`, and every event clears it. That is the
+point-mass degeneracy, and the bar floor fixes it. The inversion remains a
+real property of the estimator -- novelty does rise as a window fills with
+duplicates (0.272 -> 0.674 over twelve entries) -- but it is not what
+caused the mx1 decile table, and it does not surface at scale on these
+corpora.
 
 ### The claim
 
