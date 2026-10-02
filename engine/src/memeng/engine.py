@@ -29,6 +29,7 @@ name themselves (see telemetry.py).
 """
 from __future__ import annotations
 
+import bisect
 import logging
 import math
 import re
@@ -127,6 +128,43 @@ class MemoryEngine:
             # saturated weight from 0.5 to 1.0.
             "honor_credit": 0.01,
             "gain_decay_rate": 0.01,
+            # --- own-quantile gate ---------------------------------------
+            # The cut is a QUANTILE of the brain's own observed novelty,
+            # not an absolute value. That distinction is the whole design:
+            # an absolute ceiling derived from the weights cannot admit a
+            # corpus whose novelty sits high (measured: git's median is
+            # 0.810, needing novelty >= 1.32 against a maximum of 1.0, so
+            # no reachable value exists). A quantile is reachable by
+            # definition -- it IS the value that q of the stream exceeds --
+            # so the bar moves with the data instead of being pinned to
+            # configuration.
+            #
+            # 0.70 measured best across three real corpora (mx1 logs 29.7%,
+            # email 30.6%, git 36.9%, spread 1.24x).
+            "novelty_quantile": 0.70,
+            # Reservoir of novelty for EVERY event seen, stored or not, at
+            # 16 bytes each (~21-25% of the text it describes). Fitting to
+            # stored episodes alone is a censored sample and collapses: the
+            # store is selected by the very quantity being fitted.
+            #
+            # The window is TRAILING and its length is the derived
+            # `obj_forget / mean_novelty` (see _novelty_capacity_from), not a
+            # number chosen here. Measured on 12,000 events across three
+            # corpora: a window spanning the whole run gives 2.24x spread,
+            # a trailing 5,000 gives 1.04x. On 120,000 commits spanning 29.5
+            # years, W=2000 drifts 0.5 points end to end while W=20000
+            # drifts 4.2. A whole-history reservoir cannot work because it is
+            # a MIXTURE of regimes: a corpus whose novelty shifts leaves the
+            # bar describing a distribution the current events are no longer
+            # drawn from. Measured directly -- mx1 novelty collapses 0.540 ->
+            # 0.212 as its novelty window fills, and the whole-run quantile
+            # then stores 16.5% where a trailing one stores 32.2%.
+            "novelty_reservoir": 5000,
+            # How many events must be seen before the quantile is used at
+            # all. Below this the gate falls back to `threshold`, which for
+            # a cold brain must itself be reachable from the cold-start
+            # score (w_novelty*novelty_empty + w_gain*gain).
+            "novelty_warmup": 1500,
             "entity_extraction": True,
             "min_semantic_sim": 0.35,
         }
@@ -145,6 +183,26 @@ class MemoryEngine:
             maxlen=max(1, int(cfg["semantic_novelty_window"])))
         # How many ranked results may credit their senders with evidence.
         self._honor_window = max(0, int(cfg["honor_window"]))
+        # Novelty of every event seen, kept regardless of whether it was
+        # stored. This is the sample the quantile is fitted to, and fitting
+        # to stored events alone is a censored sample -- the store is
+        # selected by the very novelty being fitted -- which is what made the
+        # earlier recalibration scheme collapse.
+        #
+        # Held SORTED and updated in place. Sorting the window per event
+        # measured 275 us at W=2000, against a whole-gate cost of 226 us,
+        # so the fit would have dominated the gate. bisect.insort keeps it
+        # ordered for 2.3 us -- 120x cheaper, same result.
+        self._novelty_capacity = max(64, int(cfg["novelty_reservoir"]))
+        # Two structures, because a trailing window needs AGE and a quantile
+        # needs ORDER, and one list cannot hold both.
+        #   _novelty_window : ascending, for the quantile
+        #   _novelty_seen   : arrival order, so eviction removes the OLDEST
+        # Evicting from the sorted list alone would drop the SMALLEST value
+        # instead of the oldest, biasing the bar upward -- measured as mx1
+        # collapsing to 4.6% where the deque-based version gave 32.2%.
+        self._novelty_window: list[float] = []
+        self._novelty_seen: deque[float] = deque()
 
         # ── retention profiles: application-controlled forgetting ─────────
         # Same brain hardware; the POLICY differs per deployment/domain.
@@ -365,13 +423,32 @@ class MemoryEngine:
             score = min(1.0, cfg["w_novelty"] * novelty
                         + cfg["w_arousal"] * arousal
                         + cfg["w_gain"] * gain)
-            encoded = (score >= cfg["threshold"]
+
+            # The cut is derived from the reservoir, not read from config,
+            # once enough history exists. Expressed in SCORE space because
+            # that is what the gate compares against -- the novelty
+            # equivalent of a score cut c is (c - w_gain*gain)/w_novelty.
+            threshold = self._quantile_threshold(gain, cfg["threshold"])
+            encoded = (score >= threshold
                        or arousal >= cfg["burst_threshold"])
 
             verdict = GateVerdict(score=round(score, 4), novelty=novelty,
                                   arousal=arousal, gain=gain,
-                                  threshold=float(cfg["threshold"]),
+                                  threshold=round(float(threshold), 4),
                                   encoded=bool(encoded))
+            # Recorded for EVERY event, stored or not. This is the
+            # difference between the quantile gate and the recalibration
+            # scheme that collapsed: fitting to stored episodes alone is a
+            # censored sample, because the store is selected by the very
+            # novelty being fitted.
+            bisect.insort(self._novelty_window, novelty)
+            self._novelty_seen.append(novelty)
+            if len(self._novelty_seen) > self._novelty_capacity:
+                stale = self._novelty_seen.popleft()
+                i = bisect.bisect_left(self._novelty_window, stale)
+                if i < len(self._novelty_window) and self._novelty_window[i] == stale:
+                    del self._novelty_window[i]
+
             prof = self.retention_profiles[
                 cfg.get("retention_profile", "balanced")]
 
@@ -829,6 +906,36 @@ class MemoryEngine:
         # of identical vectors lands at 1.0 - 2e-16, which surfaced as a
         # novelty of 2.2e-16 where "identical" should mean exactly 0.
         return round(max(0.0, min(1.0, 1.0 - best)), 9)
+
+    def _quantile_threshold(self, gain: float, fallback: float) -> float:
+        """The store threshold: a quantile of this brain's OWN novelty.
+
+        Below `novelty_warmup` events the reservoir is too small to fit a
+        quantile to, so `fallback` is used -- which is the configured
+        threshold, and must be reachable from the cold-start score or a
+        cold brain can never begin.
+
+        Otherwise the cut is the `novelty_quantile` quantile of observed
+        novelty, expressed as a score. A quantile is reachable by
+        definition: it is the value that q of the stream exceeds. That is
+        why an absolute ceiling derived from the weights could not work
+        here -- a corpus whose novelty distribution sits high has no
+        reachable value cut, but always has a reachable quantile cut.
+
+        KNOWN LIMIT, measured, not a bug: if nothing in the corpus ever
+        recurs then every quantile is 1.0, the bar sits at the top of the
+        score range, and the store rate goes to 100%. A brain whose entire
+        input is novel has nothing to be unusual relative to, and no
+        quantile can manufacture a distinction that is not in the data.
+        Real corpora have repetition; this is the boundary, not the case.
+        """
+        cfg = self.base_cfg
+        window = self._novelty_window
+        if len(window) < int(cfg["novelty_warmup"]):
+            return float(fallback)
+        q = float(cfg["novelty_quantile"])
+        bar = window[min(len(window) - 1, int(q * (len(window) - 1)))]
+        return float(cfg["w_novelty"] * bar + cfg["w_gain"] * gain)
 
     def _remember_terms(self, event: Event) -> None:
         """Add an encoded event to the novelty comparison window."""

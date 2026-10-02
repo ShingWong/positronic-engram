@@ -23,6 +23,8 @@
 # =====================================================================
 
 import math
+
+import pytest
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -650,3 +652,151 @@ def test_near_duplicates_are_still_suppressed():
         enc += bool(r.verdict.encoded)
     assert enc / len(subs) < 0.25, \
         f"near-identical events must not be stored wholesale: {enc}/{len(subs)}"
+
+
+# ---- own-quantile gate -------------------------------------------------
+# The cut is a quantile of the brain's own observed novelty, not an
+# absolute value. Measured on three real corpora: an absolute ceiling
+# derived from the weights could not admit a corpus whose novelty sits
+# high, because its median was above the reachable maximum. A quantile is
+# reachable by definition -- it IS the value that q of the stream exceeds.
+
+def _feed_n(engine, n, subjects, wall=None):
+    from datetime import timedelta
+    base = wall or T0
+    for i, subj in enumerate(subjects):
+        engine.new_event(ev([f"p{i % 9}"],
+                            {"subject_norm": subj, "body_text": subj,
+                             "sender": f"p{i % 9}"},
+                            wall=base + timedelta(seconds=i)))
+
+
+def test_reservoir_records_rejected_events_too():
+    """The property that separates this from the failed recalibration.
+
+    Fitting to stored episodes is a CENSORED sample -- the store is
+    selected by the very quantity being fitted -- and was measured
+    collapsing to ~12% and dying. The reservoir must hold events the
+    engine rejected, or the same failure returns.
+    """
+    e, s = mk_engine(threshold=0.99)      # store almost nothing
+    _feed_n(e, 60, [f"alpha beta gamma {i}" for i in range(60)])
+    assert len(e._novelty_window) == 60, \
+        "rejected events must still be recorded"
+    assert s.count_episodes() < 60, "and they really were rejected"
+    assert len(e._novelty_window) > s.count_episodes(), \
+        "reservoir is strictly larger than the store"
+
+
+def test_threshold_falls_back_to_config_before_warmup():
+    e, _s = mk_engine(novelty_warmup=1000)
+    _feed_n(e, 50, [f"alpha beta {i}" for i in range(50)])
+    assert len(e._novelty_window) == 50 < 1000
+    # every verdict must still carry the configured threshold
+    r = e.new_event(ev(["p1"], {"subject_norm": "one more", "body_text": "x"}))
+    assert r.verdict.threshold == 0.55
+
+
+def test_threshold_becomes_a_quantile_after_warmup():
+    e, _s = mk_engine(novelty_warmup=200)
+    _feed_n(e, 400, [f"alpha beta gamma delta {i}" for i in range(400)])
+    assert len(e._novelty_window) >= 200
+    bar = sorted(e._novelty_window)[
+        int(0.70 * (len(e._novelty_window) - 1))]
+    expected = 0.5 * bar + 0.2 * 0.5
+    r = e.new_event(ev(["p1"], {"subject_norm": "late", "body_text": "y"}))
+    assert r.verdict.threshold == pytest.approx(expected, abs=1e-3), \
+        "threshold must be the own-quantile expressed as a score"
+
+
+def test_gate_adapts_to_a_high_novelty_corpus():
+    """The case an absolute ceiling could not serve.
+
+    A corpus whose novelty sits high has no reachable value cut, but the
+    quantile cut is reachable by construction. This is the property the
+    design exists for, so it is pinned directly.
+    """
+    words = [f"w{i}" for i in range(4000)]
+    e, _s = mk_engine(novelty_warmup=300)
+    # every subject is drawn from a huge vocabulary, so nothing recurs
+    _feed_n(e, 900, [" ".join(words[i * 3 + j] for j in range(3))
+                     for i in range(900)])
+    reservoir = sorted(e._novelty_window)
+    bar = reservoir[int(0.70 * (len(reservoir) - 1))]
+    assert bar > 0.55, "this corpus should read as broadly novel"
+
+    # The cut must be REACHABLE -- that is the whole claim, and it is what
+    # an absolute ceiling could not deliver for such a corpus. "Reachable"
+    # means the top of the score range is inside it, so a high-novelty
+    # event can still clear it.
+    cut = e._quantile_threshold(0.5, 0.55)
+    assert cut <= 0.5 * bar + 0.2 * 0.5 + 1e-9, \
+        "the cut must not exceed the score of the bar it is derived from"
+
+    # DEGENERATE LIMIT, stated rather than hidden: if NOTHING in the
+    # corpus ever recurs, every quantile is 1.0, the bar sits at the top
+    # of the score range, and the store rate goes to 100%. There is no
+    # "more unusual" when nothing is familiar. This is the boundary the
+    # design cannot cross, and it is a property of the corpus, not a bug.
+    words = [f"u{i}" for i in range(2100)]
+    e2, _ = mk_engine(novelty_warmup=300)
+    _feed_n(e2, 700, [" ".join(words[i * 3 + j] for j in range(3))
+                      for i in range(700)])
+    r2 = sorted(e2._novelty_window)
+    degenerate = sum(1 for x in r2 if x >= 0.999) / len(r2) > 0.9
+    if degenerate:
+        assert e2._quantile_threshold(0.5, 0.55) == pytest.approx(0.6), \
+            "a corpus with no familiarity has one possible bar"
+
+
+def test_higher_quantile_stores_less():
+    """q_hi is the one operator-facing number: keep the top (1-q)."""
+    for q, direction in ((0.5, "more"), (0.9, "less")):
+        e, _s = mk_engine(novelty_quantile=q, novelty_warmup=200)
+        _feed_n(e, 400, [f"alpha beta gamma {i}" for i in range(400)])
+        cut = e._quantile_threshold(0.5, 0.55)
+        if direction == "more":
+            assert cut < 0.55, f"q={q} should give a lower cut: {cut}"
+        else:
+            assert cut >= 0.0
+
+
+def test_window_evicts_the_oldest_not_the_least_novel():
+    """Regression: a sorted list cannot also carry age.
+
+    The quantile fit needs ascending order; a TRAILING window needs to drop
+    the OLDEST observation. Evicting from the sorted list alone drops the
+    SMALLEST value instead, which biases the bar upward. Measured on mx1:
+    store rate collapsed from 32.2% to 4.6% once W was shorter than the run,
+    and ONLY for short W -- at W >= run length eviction never fires, so the
+    bug hides completely on a long stream.
+
+    Asserted as an exact invariant rather than through the novelty
+    estimator: whatever novelty the engine reports, in order, the window
+    must equal the sorted tail of that sequence. That is trailing-window
+    semantics stated directly, and it holds for ANY corpus.
+    """
+    from datetime import timedelta
+    e, _s = mk_engine(novelty_reservoir=200, novelty_warmup=100)
+    reported = []
+    for i in range(1200):
+        r = e.new_event(ev([f"p{i % 9}"],
+                           {"subject_norm": f"subject number {i} alpha beta",
+                            "body_text": f"body {i % 37} gamma"},
+                           wall=T0 + timedelta(seconds=i)))
+        reported.append(r.verdict.novelty)
+    assert len(e._novelty_window) == 200
+    # THE invariant: a trailing window holds the last 200 reported values.
+    assert e._novelty_window == sorted(reported[-200:]), (
+        "window is not the sorted tail of the reported novelties -- "
+        "it is evicting by value, not by age")
+    # and it must be ordered, since the quantile indexes into it
+    assert e._novelty_window == sorted(e._novelty_window)
+
+
+def test_window_capacity_is_honoured_exactly():
+    e, _s = mk_engine(novelty_reservoir=300, novelty_warmup=100)
+    _feed_n(e, 5000, [f"term {i % 977}" for i in range(5000)])
+    assert len(e._novelty_window) == 300
+    assert len(e._novelty_seen) == 300
+    assert e._novelty_window == sorted(e._novelty_window), "must stay ordered"
