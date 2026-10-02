@@ -165,6 +165,13 @@ class MemoryEngine:
             # a cold brain must itself be reachable from the cold-start
             # score (w_novelty*novelty_empty + w_gain*gain).
             "novelty_warmup": 1500,
+            # Absolute minimum for the derived bar. A quantile of a
+            # distribution that has collapsed onto a point mass IS that
+            # point mass, which made the gate store 100% of mx1's
+            # repetitive dnsblog stream. Measured free on every varied
+            # corpus below 0.348 (the lowest of their own bars), so this
+            # value is mid-range with headroom, not fitted.
+            "novelty_bar_floor": 0.20,
             "entity_extraction": True,
             "min_semantic_sim": 0.35,
         }
@@ -947,6 +954,38 @@ class MemoryEngine:
             return float(fallback)
         q = float(cfg["novelty_quantile"])
         bar = window[min(len(window) - 1, int(q * (len(window) - 1)))]
+
+        # FLOOR the bar, because a quantile of a degenerate distribution is
+        # the degeneracy.
+        #
+        # Measured on mx1's dnsblog stream -- 12 distinct strings in 66,260
+        # lines -- novelty is 98.3% exactly 0.000, so the q70 quantile IS
+        # zero, the cut floors at w_gain*gain = 0.1000, and every event
+        # clears it. Store rate went 0.1% in decile 1 to 100% from decile 4
+        # on: noise filtering that DECAYS as the brain fills with copies.
+        #
+        # The pre-gate engine stored 0.0% of these lines throughout, because
+        # a fixed absolute cut sat above them by accident. A quantile cannot
+        # do that by construction: "store the top (1-q)" of a spike
+        # distribution means "store (1-q) of the boilerplate".
+        #
+        # The floor is FREE on varied input, and that is measured rather
+        # than tuned. Every corpus's own q70 bar:
+        #
+        #     mx1 0.348   email 0.760   git 0.880   pvl 0.544   dns 0.000
+        #
+        # so any floor BELOW 0.348 cannot bind on a varied corpus. Swept:
+        # every floor in (0, 0.348) takes dnsblog from 100% to 0% while
+        # leaving all four varied corpora byte-identical at spread 1.12x.
+        # The default sits mid-range with ~39% headroom to that cliff, and
+        # the cliff is PREDICTED by the lowest observed bar rather than
+        # found by search.
+        #
+        # Relative floors were measured and rejected: max(q70, q95) left
+        # dnsblog at 84.5% and drove the varied mean to 9.5% (spread
+        # 9.87x); k*max_novelty gave 27.9% at spread 2.07x. Only an
+        # absolute floor separates the two regimes.
+        bar = max(bar, float(cfg["novelty_bar_floor"]))
         return float(cfg["w_novelty"] * bar + cfg["w_gain"] * gain)
 
     def _remember_terms(self, event: Event) -> None:

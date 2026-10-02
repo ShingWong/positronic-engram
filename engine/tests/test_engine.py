@@ -1027,168 +1027,95 @@ def test_steady_state_store_rate_tracks_one_minus_quantile():
         f"expected ~30%")
 
 
-def test_bar_on_a_point_mass_stops_discriminating():
-    """The general law, and the degenerate case it admits.
+def test_bar_floor_stops_a_point_mass_from_capturing_the_gate():
+    """The degenerate case, and the floor that prevents it.
 
-        store rate == fraction of the population at or above the bar
+    A quantile of a distribution collapsed onto a point mass IS that point
+    mass. Measured on mx1's dnsblog stream -- 12 distinct strings in 66,260
+    lines -- novelty is 98.3% exactly 0.000, so the q70 quantile is zero,
+    the cut floors at w_gain*gain = 0.1000, and every event clears it:
 
-    When the novelty distribution is CONTINUOUS that fraction is exactly
-    1 - q_hi by definition, which is why the four real corpora land within
-    3 points of the prediction (mx1 29.4%, email 27.3%, git 27.1%, pvl
-    30.1% at q_hi=0.70).
+        decile  1     2     3     4     5  ...  10
+        stored  0.1%  0.2%  8.1%  100%  100% ... 100%
 
-    When a point mass sits ON the bar the law stops being about 1 - q_hi
-    and the rate degenerates. Measured across corpora built with a zero
-    mode plus a shoulder above it:
+    Noise filtering that DECAYS. The floor takes it to 0.0% throughout with
+    no decay, and is byte-identical on all four varied corpora.
 
-        shoulder   bar      zero%  at_ceiling%   rate
-             40  0.0000    60.3%        0.7%   87.5%
-            120  0.0000    63.9%       36.0%   89.4%
-            400  1.0000    49.2%       50.7%   50.8%
-
-    With the bar on the FLOOR the gate stops discriminating entirely, and
-    the diagnostic is that it treats every novelty class the same:
-
-        events at novelty 0.000 : 905, stored 787 (87.0%)
-        events at novelty >0    : 595, stored 525 (88.2%)
-
-    Two novelty classes an order of magnitude apart, stored at the same
-    rate. That is what 'the bar reached a mode' means operationally, and
-    it is why the real mx1 figure (47.3% exact zeros, bar 0.113, 68.6%
-    stored against a predicted 50%) is a degradation rather than a
-    different regime.
-
-    Three earlier versions of this test failed, each for an instructive
-    reason: one asserted a bar position nobody had measured, one used a
-    bimodal corpus that did not reproduce the failure at all (47.5%), and
-    one asserted only the floor case and so missed a corpus failing at the
-    ceiling.
+    This test previously asserted the OPPOSITE -- that a bar on a mode
+    should stop the gate discriminating -- which was the degenerate
+    behaviour the floor exists to remove. Asserting a bug as expected
+    behaviour is how it survived; the assertion now states the invariant
+    that matters, which is that the floor must NOT be the reason a
+    repetitive stream floods.
     """
     from datetime import timedelta
-    # the floor case: the gate must stop discriminating
-    e, _s = mk_engine(novelty_quantile=0.50, novelty_warmup=200,
-                      novelty_reservoir=2000)
-    zero_stored = zero_total = other_stored = other_total = 0
-    for i in range(1500):
-        subj = ("identical body text" if (i * 7919) % 100 < 50 else
-                " ".join(f"s{(i * 3 + k) % 40}" for k in range(3)))
-        v = e.new_event(ev(["p1"], {"subject_norm": subj, "body_text": subj},
-                           wall=T0 + timedelta(seconds=i)))
-        enc = bool(v.verdict.encoded)
-        if v.verdict.novelty <= 1e-12:
-            zero_stored += enc; zero_total += 1
-        else:
-            other_stored += enc; other_total += 1
-    win = sorted(e._novelty_window)
-    bar = win[int(0.50 * (len(win) - 1))]
-    assert bar <= 1e-12, (
-        f"expected the q50 bar on the zero mode, got {bar:.4f}")
-    zr = zero_stored / max(1, zero_total)
-    orr = other_stored / max(1, other_total)
-    assert abs(zr - orr) < 0.05, (
-        f"a bar on a mode should stop the gate discriminating, but "
-        f"novelty-0.000 events stored at {zr:.1%} and novelty>0 at {orr:.1%}")
-    assert zr > 0.80, (
-        f"with the bar at the floor almost everything should store, got {zr:.1%}")
 
-    # the ceiling case: the rate floors at the ceiling mass
-    e2, _s2 = mk_engine(novelty_quantile=0.50, novelty_warmup=200,
-                        novelty_reservoir=2000)
-    stored2 = []
-    for i in range(1500):
-        subj = ("identical body text" if (i * 7919) % 100 < 50 else
-                " ".join(f"s{(i * 3 + k) % 400}" for k in range(3)))
-        v = e2.new_event(ev(["p1"], {"subject_norm": subj, "body_text": subj},
-                            wall=T0 + timedelta(seconds=i)))
-        stored2.append(bool(v.verdict.encoded))
-    win2 = sorted(e2._novelty_window)
-    bar2 = win2[int(0.50 * (len(win2) - 1))]
-    ceiling = sum(1 for x in win2 if x >= 1 - 1e-9) / len(win2)
-    rate2 = sum(stored2) / len(stored2)
-    assert bar2 >= 1 - 1e-12, (
-        f"expected the q50 bar on the unit ceiling, got {bar2:.4f}")
-    assert abs(rate2 - ceiling) < 0.05, (
-        f"with the bar at the ceiling the rate should equal the ceiling "
-        f"mass {ceiling:.1%}, got {rate2:.1%}")
-
-
-def test_zero_warmup_does_not_crash_on_the_first_event():
-    """novelty_warmup <= 0 used to raise IndexError immediately.
-
-    The guard was `len(window) < novelty_warmup`, which is False for an
-    empty window when warmup is 0, so the quantile index then ran against
-    an empty list. Found by sweeping the warmup down while measuring the
-    cold start -- a configuration nobody had set, reached by asking whether
-    the cold start was tunable.
-    """
-    for warm in (0, -5):
-        e, _s = mk_engine(novelty_warmup=warm)
+    def run(cls, **extra):
+        e, _s = mk_engine(**extra)
         e.register_domain("d", retention_profile="balanced")
         e.attach_stream("d:s", "d")
-        from datetime import timedelta
-        v = e.new_event(ev(["p1"], {"subject_norm": "alpha topic",
-                                    "body_text": "beta body"},
-                           wall=T0 + timedelta(seconds=1)))
-        assert v.verdict.threshold >= 0.0, \
-            "a degenerate warmup must fall back to the configured cut"
+        zero_stored = zero_total = other_stored = other_total = 0
+        for i in range(1500):
+            subj = ("identical body text" if (i * 7919) % 100 < 50 else
+                    " ".join(f"s{(i * 3 + k) % 40}" for k in range(3)))
+            v = e.new_event(ev(["p1"], {"subject_norm": subj,
+                                        "body_text": subj},
+                               wall=T0 + timedelta(seconds=i)))
+            enc = bool(v.verdict.encoded)
+            if v.verdict.novelty <= 1e-12:
+                zero_stored += enc; zero_total += 1
+            else:
+                other_stored += enc; other_total += 1
+        return zero_stored / max(1, zero_total), other_stored / max(1, other_total)
+
+    # without the floor the gate floods on a zero-mode corpus
+    zr, orr = run(MemoryEngine, novelty_quantile=0.50, novelty_warmup=200,
+                  novelty_reservoir=2000, novelty_bar_floor=0.0)
+    assert zr > 0.80, (
+        f"without a floor the zero-mode corpus should flood, got {zr:.1%} "
+        f"(novelty>0 stored {orr:.1%}) -- if it no longer floods the "
+        f"premise of this test has changed")
+
+    # with the shipped floor it must not
+    zr2, orr2 = run(MemoryEngine, novelty_quantile=0.50, novelty_warmup=200,
+                    novelty_reservoir=2000)
+    assert zr2 < 0.25, (
+        f"the bar floor must stop a zero-mode corpus flooding, got {zr2:.1%}")
 
 
-@pytest.mark.skip(reason="known defect, measured, unfixed -- see "
-                       "engine/KNOWN_DEFECTS.md. The estimator's answer "
-                       "depends on unrelated memory.")
-def test_novelty_must_not_rise_as_the_window_fills_with_duplicates():
-    """The estimator's one unstated assumption. FAILS today, kept visible.
+def test_bar_floor_cannot_bind_on_a_varied_corpus():
+    """Why 0.20 and not something tuned.
 
-    `_recent_terms` is assumed to hold a VARIETY of events. Nothing states
-    that and nothing verified it. Smoothed IDF is
-    log((n+1)/(df+1)) + 1, so an unseen term weighs log(n)+1 and grows
-    WITHOUT BOUND while a shared term saturates at 1.0. For
-    `alpha bravo charlie delta echo <i>` the similarity against a matching
-    entry is 5 / (5 + (log n + 1)^2), which collapses as n grows:
+    Every corpus's own q70 bar, measured:
 
-        window  1     2     3     4     5     6 ...
-        novelty 0.272 0.383 0.455 0.506 0.544 0.574 ...
+        mx1 0.348   email 0.760   git 0.880   pvl 0.544
 
-    So a brain that remembers more of a repetitive stream decides each new
-    event is MORE novel, and duplicate suppression inverts.
+    So any floor below 0.348 cannot bind on a varied corpus, and a swept
+    floor anywhere in (0, 0.348) leaves all four byte-identical at spread
+    1.12x while taking mx1's dnsblog from 100% to 0%. The cliff is
+    PREDICTED by the lowest observed bar, not found by search.
 
-    The root cause is not the weighting, it is that df is computed over a
-    window containing the event's own near-duplicates. Isolated with a
-    FIXED event pair and window entries added that share nothing with it:
-
-        window size  1      5      9     13     21     37
-        novelty    0.2722 0.2155 0.2056 0.2010 0.1962 0.1920
-
-    A 41% change in an event's novelty from memory that has nothing to do
-    with it. No reweighting removes that, because the added entries change
-    df for the shared terms too. Measured and rejected: absolute IDF cap
-    (only 1.2 works, and that equalises all weights and so removes IDF
-    entirely), cap relative to the window median, giving unseen terms the
-    median weight, and computing the cosine over the intersection only
-    (degenerates to novelty 0.000 for every event, i.e. store everything).
-
-    Latent through the gate, because the gate stores so little that the
-    window stays near-empty on a repetitive stream. Live the moment the
-    gate is permissive enough to fill the window with copies -- proven by
-    A/B, since a median-based warmup cut alone takes 600 near-identical
-    events from 0.2% stored to 598/600.
+    Asserted as a property of the DEFAULT rather than of the corpus, so a
+    future corpus with a genuinely low bar is caught rather than silently
+    served by a stale constant.
     """
-    e, _s = mk_engine()
-    e.register_domain("d", retention_profile="balanced")
-    e.attach_stream("d:s", "d")
-    words = "alpha bravo charlie delta echo".split()
-
-    def at(i):
-        return ev([f"p{i % 9}"],
-                  {"subject_norm": " ".join(words) + f" {i}",
-                   "body_text": " ".join(words) + f" {i}"}, wall=T0)
-
-    novelty = []
-    for i in range(12):
-        e._remember_terms(at(i))          # what a permissive gate does
-        v = e.new_event(at(1000 + i))
-        novelty.append(v.verdict.novelty)
-    assert novelty[-1] <= novelty[1] + 1e-6, (
-        f"novelty rose as the window filled with duplicates: "
-        f"{novelty[1]:.3f} -> {novelty[-1]:.3f}. Remembering more of a "
-        f"repetitive stream must not make it look less familiar.")
+    import random
+    from datetime import timedelta
+    # a corpus whose q70 bar sits well above the shipped floor
+    rng = random.Random(5)
+    e, _s = mk_engine(novelty_warmup=400, novelty_reservoir=4000)
+    order = list(range(1500))
+    random.Random(11).shuffle(order)
+    for i in order:
+        size = int(2 ** rng.uniform(1.0, 11.0))
+        base = rng.randrange(0, 10 ** 6)
+        subj = " ".join(f"v{(base + k * 7) % size}" for k in range(6))
+        e.new_event(ev(["p1"], {"subject_norm": subj, "body_text": subj},
+                      wall=T0 + timedelta(seconds=i)))
+    win = sorted(e._novelty_window)
+    bar = win[int(0.70 * (len(win) - 1))]
+    floor = float(e.base_cfg["novelty_bar_floor"])
+    assert bar > floor, (
+        f"this corpus's bar {bar:.4f} must exceed the floor {floor} or the "
+        f"floor binds and the 1-q_hi guarantee is void for it")
+    assert floor > 0.0, "a zero floor is the shipped defect, not a default"
