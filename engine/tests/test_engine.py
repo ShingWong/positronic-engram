@@ -800,3 +800,46 @@ def test_window_capacity_is_honoured_exactly():
     assert len(e._novelty_window) == 300
     assert len(e._novelty_seen) == 300
     assert e._novelty_window == sorted(e._novelty_window), "must stay ordered"
+
+
+def test_fallback_results_do_not_earn_relationship_gain():
+    """A recall that MATCHED NOTHING must not teach the brain who matters.
+
+    When both relevance channels come back empty, `activate` answers from
+    the recency fallback -- measured on the White House corpus, a query for
+    'qqzzxx nonexistent' returned 5 episodes, identical to a real hit. That
+    is intended and already tested (test_fuzzy.py:271), and the caller can
+    see it via `fallback: True`.
+
+    The defect was that H18 never looked. It credited every person named in
+    a returned episode, so a nonsense query raised the weight of whoever
+    happened to be recent: measured as 20 identities gaining weight from a
+    query that matched nothing. Gain is supposed to mean "this was recalled
+    on request", so fallback results must not earn it.
+    """
+    e, s = mk_engine()
+    e.register_domain("d", retention_profile="balanced")
+    e.attach_stream("d:s", "d")
+    recent = []
+    for i in range(40):
+        e.new_event(ev([f"p{i}"], {"subject_norm": f"alpha topic {i}",
+                                   "body_text": f"alpha body {i}"}))
+        recent.append(f"p{i}")
+
+    def weights():
+        return {p: float(e.store.get_person(p)["weight"])
+                for p in recent if e.store.get_person(p)}
+
+    # a real term matches -> gain is legitimate evidence
+    e.activate({"text": "alpha"}, k=5)
+    after_hit = {p: w for p, w in weights().items() if w != 0.5}
+
+    # a query matching nothing is answered by recency, and must earn nothing
+    miss = e.activate({"text": "qqzzxx nonexistent"}, k=5)
+    assert miss and all(o["fallback"] for o in miss), \
+        "expected the recency fallback, and it must be flagged as such"
+    after_miss = {p: w for p, w in weights().items() if w != 0.5}
+
+    assert after_miss == after_hit, (
+        "a query that matched nothing changed relationship gain: "
+        f"{len(after_miss) - len(after_hit)} identities credited from noise")

@@ -731,9 +731,18 @@ class MemoryEngine:
             #
             # Ranked-weighted, and only for results the caller actually gets
             # back, so a large k that is then truncated cannot inflate it.
+            # Only credit retrieval that actually MATCHED. When both
+            # relevance channels came back empty the recency fallback
+            # answered instead -- a query for 'qqzzxx nonexistent' returns
+            # the most recent episodes -- and `fallback` marks that. Crediting
+            # it taught the brain that whoever happened to be recent matters,
+            # which is noise, not evidence: measured as 20 identities gaining
+            # weight from a nonsense query. The fallback is still the right
+            # answer for a caller browsing by recency; it is not evidence that
+            # anything was recalled on request.
             for rank, eid in enumerate(fused[:self._honor_window], 1):
                 ep = eps_by_id.get(eid)
-                if ep and not consolidation:
+                if ep and not consolidation and not fallback:
                     self.store.honor_persons(
                         ep.persons or [],
                         weight=float(self.base_cfg["honor_credit"]) / rank)
