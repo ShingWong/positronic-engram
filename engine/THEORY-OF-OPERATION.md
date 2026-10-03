@@ -163,7 +163,7 @@ Weights sum to 1.0, so the score is a convex combination and lands in [0,1].
 ### 4.2 The cut, and why it is derived
 
 This is the heart of the design. The cut is **not** read from config. Once
-the reservoir holds at least `novelty_warmup = 1500` values:
+the reservoir holds at least the effective warmup (see §4.4):
 
 ```
  bar = max( q₀.₇(reservoir),  novelty_bar_floor )          floor = 0.20
@@ -238,26 +238,54 @@ rather than found by search.
 
 ### 4.4 Warmup
 
-Below 1500 events the reservoir cannot support a quantile, so `threshold
-= 0.55` applies.
+Before the reservoir holds enough observations the quantile is not trusted,
+and `threshold = 0.55` applies instead.
 
-**The cold-start problem this creates.** A fixed cut is reachable only by a
-brain whose novelty clears it. A low-novelty corpus stores almost nothing,
-so the recency window stays nearly empty, so novelty stays high, so nothing
-clears the cut. Traced on mx1:
+**The warmup count is rate-aware.** Three knobs:
 
-| events | 100 | 500 | 1000 | **1500** | 2000 | 3000 |
-|---|---|---|---|---|---|---|
-| stored | 8.0% | 2.2% | 1.2% | **0.9%** | 2.5% | 2.1% |
-| recency window | 8 | 11 | 12 | **13** | 50 | 62 |
-| cut | 0.55 | 0.55 | 0.55 | **0.55** | 0.476 | 0.443 |
+| knob | default | meaning |
+|---|---|---|
+| `novelty_warmup` | 200 | the count, for a fast feed |
+| `novelty_warmup_floor` | 200 | never trust the quantile below this |
+| `novelty_warmup_max_days` | 7.0 | never wait longer than this |
 
-**13 episodes in the first 1500 events.** The brain is blind for its entire
-warmup. The opening rate tracks the fallback cut directly — cut 0.55 → 2.2%,
-0.40 → 13.4%, 0.30 → 28.2% — so no fixed value serves a corpus whose novelty
-sits low.
+The effective warmup is `observed_rate × max_days`, shortened to the floor
+and capped at the configured count. It only ever shortens, so a slow patch
+of history cannot extend a warmup already served.
 
-**This is deliberately not fixed at the gate**, because every warmup
+**Why this is in days.** An event count is a duration in deployment, and an
+unpredictable one:
+
+| feed | measured rate | 1500 events | 200 events |
+|---|---|---|---|
+| mx1 mail log | 40/min | 38 minutes | 5 seconds |
+| pvl visitor log | 175/day | 8.6 days | 1.1 days |
+| git commit subjects | 11.2/day | **134 days** | 18 days |
+
+One constant spanning four orders of magnitude in time. Reported per-corpus
+in *events* it looks identical everywhere, which is exactly how the problem
+stayed invisible.
+
+**Why 1500 was never a statistical requirement.** The 70th-percentile bar
+is stable from ~50 observations — store rate at warmup 50 / 200 / 1500
+differs by under 1.2 points across git, pvl and email. It was the number
+nobody had questioned.
+
+Measured opening rates by quarter at 20,000 events:
+
+| warmup | mx1 | email | git | pvl |
+|---|---|---|---|---|
+| **200** | 17% 30% 30% 29% | 27% 26% 28% 30% | 31% 35% 32% 31% | 23% 32% 29% 29% |
+| 1500 | 3% 23% 31% 29% | 27% 27% 28% 30% | 26% 35% 32% 31% | 8% 16% 31% 28% |
+
+200 reaches steady state in the second quarter on every corpus; 1500 sits at
+3–16% for two to three quarters. On a slow feed the fixed cut is what the
+brain runs on, and a fixed cut is reachable only by a brain whose novelty
+happens to clear it — a low-novelty corpus stores almost nothing, the
+recency window stays near-empty, novelty stays high, and nothing clears the
+cut. Traced on mx1 at warmup=1500: **13 episodes in the first 1500 events.**
+
+**The residual cold start is not fixed at the gate**, because every warmup
 statistic that opens the brain also floods it — see §7. It is fixed
 downstream instead, by garbage collection.
 
@@ -452,14 +480,14 @@ cycle, never permanent**.
 
 ---
 
-## 7. The cold-start deadlock, and why the gate is left alone
+## 7. The cold-start deadlock, and how GC breaks it
 
 The obvious fix is a self-calibrating warmup — use the median of novelty seen
 so far, which is reachable by construction from five observations. It works:
 mx1 opens 2.1% → 29.8%, pvl 6.4% → 37.9%.
 
-It is not shipped, because on repetitive input the cold start and duplicate
-suppression are **the same knob**:
+It is not applied *at the gate*, because on repetitive input the cold start
+and duplicate suppression are **the same knob**:
 
 | warmup statistic | dup stored | mx1 opens |
 |---|---|---|
@@ -557,7 +585,9 @@ Verified end to end on a live brain:
 | `novelty_quantile` | 0.70 | the store-rate target; rate ≈ 1 − q | **the only steady-state parameter.** Tracks prediction within 3 points on 4 corpora |
 | `novelty_reservoir` | 5000 | trailing window length, 16 B/event | W ≥ 12000 lets the reservoir span a whole run; mx1 collapses to 16.5% |
 | `novelty_bar_floor` | 0.20 | minimum value for the derived bar | free below 0.348 (lowest varied bar); stops a point mass capturing the gate |
-| `novelty_warmup` | 1500 | events before the quantile is trusted | below this a quantile is not supportable |
+| `novelty_warmup` | 200 | events before the quantile is trusted | the quantile is stable from ~50; 1500 was unexamined |
+| `novelty_warmup_floor` | 200 | never trust the quantile below this | a floor is needed even though it is low |
+| `novelty_warmup_max_days` | 7.0 | never wait longer than this | 1500 events = 134 days at git's 11.2/day |
 | `dedup_window` | 200 | near-duplicate comparison horizon | **known gap**: a copy arriving later than this escapes |
 | `dedup_span_seconds` | 86400 | beyond this gap, same words + same actor is a NEW event | sits inside the observed gap distribution: mx1 duplicates are all within 1h, git's recur across years |
 | `threshold` | 0.55 | the warmup fallback cut | not reachable for low-novelty corpora; the cold start, §4.4 |
@@ -599,31 +629,29 @@ Verified end to end on a live brain:
    prior in pure ingest. H18 learns from *retrieval*; a workload that never
    queries its own memory runs with the gain channel dead.
 
-5. **The cold start costs 1500 events, and that is a DURATION in
-   deployment, not a fixed annoyance.** `novelty_warmup` is an event
-   count, so the wall-clock blind spot is 1500 / event_rate. Measured rates:
+5. **The cold start is now rate-aware, and what remains is the floor.**
+   Mitigated: the warmup is `rate × max_days`, so a slow feed drops to the
+   200-event floor rather than waiting 1500 events. Measured blind spots:
 
-   | feed | measured rate | blind spot for 1500 events |
-   |---|---|---|
-   | mx1 mail log | 40/min (1.5M events over 26.2 days) | **38 minutes** |
-   | pvl visitor log | 175/day (331k over 5.19 years) | **8.6 days** |
-   | git commit subjects | 11.2/day (120k over 29.4 years) | **134 days** |
+   | feed | rate | before (1500) | now |
+   |---|---|---|---|
+   | mx1 mail log | 40/min | 38 minutes | ~5 seconds |
+   | pvl visitor log | 175/day | 8.6 days | ~1 day |
+   | git commit subjects | 11.2/day | 134 days | **18 days** |
 
-   Note the ordering inverts against intuition: the corpus with the most
-   events has the *shortest* blind spot, because rate is what matters, not
-   volume. A deployment shaped like git -- a few real events a day, over
-   years -- spends **four months** unable to calibrate.
+   Residual: a feed below ~29 events/day cannot reach the 200 floor inside
+   7 days, so it waits -- capped at 7 days of miscalibration rather than
+   unbounded. That bound is deliberate; the alternative is trusting a
+   quantile fitted on too few observations.
 
-   This is the highest-severity open issue for a slow feed, and it is easy
-   to miss because reporting it per-corpus in *events* makes it look
-   identical across all of them. Reporting it in *days* is what shows a
-   pvl-shaped deployment spending its first week blind.
+   The ordering inverts against intuition and is worth knowing: the corpus
+   with the most events has the *shortest* blind spot, because rate is what
+   matters, not volume.
 
-   Garbage collection removes the correctness cost -- the brain may open
-   freely and the copies are removed later, measured net 2 episodes from
-   5,880 admitted -- but it does not remove the fact that during warmup the
-   quantile path is not in service, so the store rate is whatever the
-   fallback cut allows rather than the calibrated 1 - q.
+   Garbage collection removes the correctness cost on top -- the gate may
+   open freely and the copies are removed later, measured net 2 episodes
+   from 5,880 admitted -- so a permissive warmup is now safe rather than a
+   flood.
 
 6. **`w_arousal` and `burst_threshold` are untested.** Every corpus measured
    carries α = 0.
