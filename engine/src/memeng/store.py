@@ -283,9 +283,19 @@ class SQLiteStore:
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(episode)")}
         ocols = {r[1] for r in self.conn.execute("PRAGMA table_info(object)")}
         dcols = {r[1] for r in self.conn.execute("PRAGMA table_info(domain)")}
+        scols = {r[1] for r in self.conn.execute("PRAGMA table_info(stream)")}
         if "retention_profile" not in dcols:
             self.conn.execute(
                 "ALTER TABLE domain ADD COLUMN retention_profile TEXT")
+        # `last_event_wall` was added to the stream DDL without a migration, so
+        # every database created before it lacks the column -- and
+        # `set_stream_time` writes it on EVERY event, so ingest into any
+        # existing brain died with "no such column: last_event_wall". Found by
+        # running `positronic consolidate` against the live brain, not by
+        # reading the code: all five live brains were affected.
+        if "last_event_wall" not in scols:
+            self.conn.execute(
+                "ALTER TABLE stream ADD COLUMN last_event_wall REAL")
         for col, decl in (("class_materiality", "TEXT"),
                           ("class_animacy", "TEXT"),
                           ("class_origin", "TEXT"),

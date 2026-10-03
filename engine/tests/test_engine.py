@@ -1561,3 +1561,46 @@ def test_prune_does_not_query_loop_invariants_per_episode():
     assert per_episode <= 4, (
         f"a loop-invariant lookup ran {per_episode} times across {live} "
         f"episodes; it must be memoised, not repeated")
+
+
+def test_store_migrates_a_pre_last_event_wall_database(tmp_path):
+    """A brain created before `stream.last_event_wall` existed must still work.
+
+    `set_stream_time` writes that column on EVERY event, so the missing
+    column made ingest fail with "no such column: last_event_wall" against
+    every brain created before the DDL change. Found by running
+    `positronic consolidate` against the live brain, not by reading code --
+    all five live brains had the pre-change `stream` table.
+
+    Non-vacuous: without the migration branch this raises IntegrityError /
+    OperationalError on the first event.
+    """
+    import sqlite3
+
+    path = str(tmp_path / "old_brain.db")
+    conn = sqlite3.connect(path)
+    # the pre-change stream table: no last_event_wall
+    conn.execute("CREATE TABLE stream (stream TEXT PRIMARY KEY, "
+                 "domain_id INTEGER, tau REAL NOT NULL DEFAULT 0.0, "
+                 "mono INTEGER NOT NULL DEFAULT 0)")
+    conn.execute("INSERT INTO stream(stream,domain_id,tau,mono) "
+                 "VALUES('d:s',1,3.0,7)")
+    conn.commit()
+    conn.close()
+
+    s = SQLiteStore(path)
+    cols = {r[1] for r in s.conn.execute("PRAGMA table_info(stream)")}
+    assert "last_event_wall" in cols, (
+        "the pre-change stream table was not migrated; ingest will fail "
+        "with 'no such column' on the first event")
+
+    e = MemoryEngine(s, {})
+    e.init_database()
+    e.new_event(ev(["p"], {"subject_norm": "probe alpha",
+                           "body_text": "probe beta"},
+                   stream="d:s", wall=T0))
+    assert s.conn.execute(
+        "SELECT last_event_wall FROM stream WHERE stream='d:s'"
+    ).fetchone()[0] is not None, (
+        "the column exists but is never populated, so the idle-accrual "
+        "clock has nothing to read")
