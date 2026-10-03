@@ -200,6 +200,20 @@ class MemoryEngine:
             # Never calibrate on fewer than this many observations.
             "novelty_warmup_floor": 200,
             # ...nor wait longer than this many days for a slow feed.
+            # INERT AT THE SHIPPED DEFAULTS, and that is deliberate rather
+            # than accidental. Because `novelty_warmup == novelty_warmup_floor
+            # == 200`, `max(floor, min(base, rate x days))` is 200 for ANY
+            # rate -- verified from 0.1 to 1428 events/day. So the default
+            # path contains NO wall-clock term at all, which is the
+            # property that matters: the clock the gate runs on is a count
+            # of the brain's own observations, not of seconds.
+            #
+            # The knob stays because it is the only escape from the floor,
+            # and the floor is the one thing that cannot be derived: a feed
+            # too slow to accumulate 200 observations cannot be calibrated
+            # by any amount of waiting. Raising the floor above the count,
+            # or setting max_days > 0 with a floor below the count, makes
+            # this live again. Measured trigger: rate < 200/7 = 28.6/day.
             "novelty_warmup_max_days": 7.0,
             # Absolute minimum for the derived bar. A quantile of a
             # distribution that has collapsed onto a point mass IS that

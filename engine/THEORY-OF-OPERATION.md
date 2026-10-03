@@ -253,6 +253,22 @@ The effective warmup is `observed_rate × max_days`, shortened to the floor
 and capped at the configured count. It only ever shortens, so a slow patch
 of history cannot extend a warmup already served.
 
+**At the shipped defaults this arithmetic contains no wall clock at all.**
+Because `novelty_warmup == novelty_warmup_floor == 200`,
+
+```
+ max(floor, min(base, rate × days)) == base      for ANY rate
+```
+
+verified from 0.1 to 1428 events/day. So the gate's warmup is a count of
+the brain's own observations, not of seconds — which is the point of ditching
+the wall clock, and it happens by arithmetic rather than by deletion. The
+knob remains as the only escape from the floor, and the floor is the one
+thing that cannot be derived: a feed too slow to accumulate 200
+observations cannot be calibrated by waiting. Raising the floor above the
+count, or setting `max_days > 0` with a floor below it, makes the wall clock
+live again; a test asserts the arithmetic so that change is caught.
+
 **Why this is in days.** An event count is a duration in deployment, and an
 unpredictable one:
 
@@ -587,7 +603,7 @@ Verified end to end on a live brain:
 | `novelty_bar_floor` | 0.20 | minimum value for the derived bar | free below 0.348 (lowest varied bar); stops a point mass capturing the gate |
 | `novelty_warmup` | 200 | events before the quantile is trusted | the quantile is stable from ~50; 1500 was unexamined |
 | `novelty_warmup_floor` | 200 | never trust the quantile below this | a floor is needed even though it is low |
-| `novelty_warmup_max_days` | 7.0 | never wait longer than this | 1500 events = 134 days at git's 11.2/day |
+| `novelty_warmup_max_days` | 7.0 | escape from the floor | **inert by default** — equals base for any rate; live only if the floor is lowered |
 | `dedup_window` | 200 | near-duplicate comparison horizon | **known gap**: a copy arriving later than this escapes |
 | `dedup_span_seconds` | 86400 | beyond this gap, same words + same actor is a NEW event | sits inside the observed gap distribution: mx1 duplicates are all within 1h, git's recur across years |
 | `threshold` | 0.55 | the warmup fallback cut | not reachable for low-novelty corpora; the cold start, §4.4 |

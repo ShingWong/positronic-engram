@@ -1430,3 +1430,41 @@ def test_warmup_is_capped_in_days_for_a_slow_feed():
 
     # and an unobserved stream must fall back to the configured value
     assert e._effective_warmup("never:seen") == 1500
+
+
+def test_default_warmup_contains_no_wall_clock_term():
+    """The shipped gate runs on a count of its own observations, not on
+    seconds.
+
+    `novelty_warmup_max_days` looks load-bearing and is not: with
+    `novelty_warmup == novelty_warmup_floor == 200`,
+
+        max(floor, min(base, rate x days)) == base
+
+    for ANY rate. Verified from 0.1 to 1428 events/day. So the default path
+    has no wall-clock dependence at all -- which is the point of ditching
+    it, and it happens by arithmetic rather than by deletion.
+
+    The knob stays because it is the only escape from the floor, and the
+    floor is the one thing that cannot be derived: a feed too slow to
+    accumulate 200 observations cannot be calibrated by waiting.
+
+    This asserts the ARITHMETIC, so that raising the floor above the count
+    -- which would silently make the wall clock live again -- is caught
+    rather than discovered in production.
+    """
+    import time as _time
+    cfg = MemoryEngine.default_config()
+    base = int(cfg["novelty_warmup"])
+    floor = int(cfg["novelty_warmup_floor"])
+    assert base == floor, (
+        f"novelty_warmup={base} != novelty_warmup_floor={floor}, so the "
+        f"wall-clock cap is LIVE by default -- the gate would depend on "
+        f"seconds, which the design ditches")
+    e, _s = mk_engine()
+    now = _time.time()
+    for n in (1, 7, 50, 200, 2000, 10000):
+        e._rate_stamps = {"d:s": (now - 7 * 86400.0, n)}
+        assert e._effective_warmup("d:s") == base, (
+            f"rate {n / 7:.1f}/day changed the warmup to "
+            f"{e._effective_warmup('d:s')}")
