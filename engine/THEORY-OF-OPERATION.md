@@ -245,8 +245,8 @@ and `threshold = 0.55` applies instead.
 
 | knob | default | meaning |
 |---|---|---|
-| `novelty_warmup` | 200 | the count, for a fast feed |
-| `novelty_warmup_floor` | 200 | never trust the quantile below this |
+| `novelty_warmup` | 50 | the count, for a fast feed |
+| `novelty_warmup_floor` | 50 | never trust the quantile below this |
 | `novelty_warmup_max_days` | 7.0 | never wait longer than this |
 
 The effective warmup is `observed_rate × max_days`, shortened to the floor
@@ -254,7 +254,7 @@ and capped at the configured count. It only ever shortens, so a slow patch
 of history cannot extend a warmup already served.
 
 **At the shipped defaults this arithmetic contains no wall clock at all.**
-Because `novelty_warmup == novelty_warmup_floor == 200`,
+Because `novelty_warmup == novelty_warmup_floor == 50`,
 
 ```
  max(floor, min(base, rate × days)) == base      for ANY rate
@@ -264,45 +264,101 @@ verified from 0.1 to 1428 events/day. So the gate's warmup is a count of
 the brain's own observations, not of seconds — which is the point of ditching
 the wall clock, and it happens by arithmetic rather than by deletion. The
 knob remains as the only escape from the floor, and the floor is the one
-thing that cannot be derived: a feed too slow to accumulate 200
+thing that cannot be derived: a feed too slow to accumulate 50
 observations cannot be calibrated by waiting. Raising the floor above the
 count, or setting `max_days > 0` with a floor below it, makes the wall clock
 live again; a test asserts the arithmetic so that change is caught.
 
-**Why this is in days.** An event count is a duration in deployment, and an
-unpredictable one:
+**Why 50 and not 200.** The bar is the empirical q-th percentile of the
+reservoir, and that is stable from ~50 observations. The floor was set at
+200 anyway — the measurement pointing at 50 sat in the notes while the
+constant nobody re-examined sat in the config. Sweeping it settles the
+question on all four corpora:
 
-| feed | measured rate | 1500 events | 200 events |
-|---|---|---|---|
-| mx1 mail log | 40/min | 38 minutes | 5 seconds |
-| pvl visitor log | 175/day | 8.6 days | 1.1 days |
-| git commit subjects | 11.2/day | **134 days** | 18 days |
+| warmup | mx1 | email | git | pvl | mean | bar SD (git) |
+|---|---|---|---|---|---|---|
+| 25 | 28.7% | 28.5% | 31.5% | 29.1% | 29.5% | 0.0015 |
+| **50** | 29.2% | 28.5% | 31.4% | 29.0% | **29.5%** | **0.0012** |
+| 100 | 28.5% | 28.5% | 31.6% | 29.1% | 29.4% | 0.0013 |
+| 200 | 29.6% | 29.0% | 31.4% | 28.7% | 29.7% | 0.0013 |
+| 400 | 29.8% | 28.9% | 31.5% | 28.7% | 29.7% | 0.0015 |
+
+Flat from 25 to 400, in the mean *and* in the bar's own variance — so this
+is not a stable mean over a jittery bar. A longer warmup buys no accuracy.
+
+**A shorter warmup does not flood**, which was the reason it had not been
+tried. §7 shows every warmup statistic that opens the brain floods it, but
+those were *derived* statistics — a median is the value half the stream
+exceeds, so it admits half the stream by construction, forever. A shorter
+fixed count is different in kind: pre-trust admissions are bounded by the
+count itself, so 50 is a strictly smaller worst case than 200.
+
+| corpus | pre-trust @50 | pre-trust @200 | net after GC @50 | @200 |
+|---|---|---|---|---|
+| mx1 | 8 | 8 | 3 | 4 |
+| email | 18 | 52 | 23 | 23 |
+| git | 17 | 41 | 10 | 10 |
+| pvl | 3 | 3 | 21 | 21 |
+
+Fewer admissions before trust, identical results after GC. The first 50
+decisions are byte-identical either way, because at warmup 50 the first 50
+events are still pre-trust and still run the fixed cut.
+
+**What 200 was actually costing.** Time to calibration, at the measured
+rates:
+
+| feed | measured rate | 1500 events | 200 events | 50 events |
+|---|---|---|---|---|
+| mx1 mail log | 40/min | 38 minutes | 5 seconds | 1.3 seconds |
+| pvl visitor log | 175/day | 8.6 days | 1.1 days | 0.29 days |
+| git commit subjects | 11.2/day | **134 days** | 18 days | 4.5 days |
 
 One constant spanning four orders of magnitude in time. Reported per-corpus
 in *events* it looks identical everywhere, which is exactly how the problem
-stayed invisible.
+stayed invisible. Lowering the floor to 50 cuts the residual cold start from
+18 days to 4.5 on a git-shaped feed, and widens the covered range of rates
+from *above* 28.6 events/day to *above* 7.1.
+
+**τ was the obvious trigger and it is the wrong one.** §8.1 makes τ the
+engine's experiential clock, and idle accrues into it, so a warmup in τ
+would have answered "regardless of the wall clock" directly. Measured, τ
+over the same 200 events is:
+
+| corpus | τ@50 | τ@100 | τ@200 | τ@400 | τ/event |
+|---|---|---|---|---|---|
+| mx1 | 31.5 | 49.7 | 87.4 | 143.4 | 0.437 |
+| email | 70.9 | 147.6 | 297.7 | 614.0 | 1.488 |
+| pvl | 71.7 | 155.6 | 252.6 | 473.1 | 1.263 |
+| git | 385.8 | 662.8 | 1174.7 | 2140.2 | 5.873 |
+
+A **13× spread** where an event count has none, because τ accrues from
+silence and these corpora have different gap structure — git's mean gap is
+days, mx1's is seconds. τ is the corpus-*dependent* unit, which is the
+opposite of what it was wanted for. The count of events wins.
 
 **Why 1500 was never a statistical requirement.** The 70th-percentile bar
-is stable from ~50 observations — store rate at warmup 50 / 200 / 1500
-differs by under 1.2 points across git, pvl and email. It was the number
-nobody had questioned.
+is stable from ~50 observations. It was the number nobody had questioned —
+and so was the 200 that replaced it.
 
 Measured opening rates by quarter at 20,000 events:
 
 | warmup | mx1 | email | git | pvl |
 |---|---|---|---|---|
-| **200** | 17% 30% 30% 29% | 27% 26% 28% 30% | 31% 35% 32% 31% | 23% 32% 29% 29% |
+| **50** | 20% 31% 29% 29% | 27% 26% 27% 30% | 32% 35% 32% 31% | 24% 30% 29% 29% |
+| 200 | 17% 30% 30% 29% | 27% 26% 28% 30% | 31% 35% 32% 31% | 23% 32% 29% 29% |
 | 1500 | 3% 23% 31% 29% | 27% 27% 28% 30% | 26% 35% 32% 31% | 8% 16% 31% 28% |
 
-200 reaches steady state in the second quarter on every corpus; 1500 sits at
-3–16% for two to three quarters. On a slow feed the fixed cut is what the
+50 reaches steady state in the second quarter on every corpus, and opens
+marginally *better* than 200 — its first quarter is 20% against 17% on mx1
+and 24% against 23% on pvl. 1500 sits at 3–16% for two to three quarters.
+On a slow feed the fixed cut is what the
 brain runs on, and a fixed cut is reachable only by a brain whose novelty
 happens to clear it — a low-novelty corpus stores almost nothing, the
 recency window stays near-empty, novelty stays high, and nothing clears the
 cut. Traced on mx1 at warmup=1500: **13 episodes in the first 1500 events.**
 
-**The residual cold start is not fixed at the gate**, because every warmup
-statistic that opens the brain also floods it — see §7. It is fixed
+**The residual cold start is not fixed at the gate**, because every *derived*
+warmup statistic that opens the brain also floods it — see §7. It is fixed
 downstream instead, by garbage collection.
 
 ### 4.5 Gain cancels, and that is not a bug
@@ -515,6 +571,13 @@ and duplicate suppression are **the same knob**:
 Every statistic that opens the brain also floods it, because on a
 repetitive stream admitting *any* extra events means admitting copies.
 
+This does **not** argue against *shortening* the fixed cut, which is a
+different knob: a derived statistic admits a fixed *fraction* of the stream
+forever, while a shorter fixed count bounds pre-trust admissions by the count
+itself. That is why §4.4 could move the warmup from 200 to 50 — fewer
+admissions before trust, identical results after GC — while a self-calibrating
+warmup still cannot go in at the gate.
+
 **Garbage collection dissolves it instead of trading along it.** The gate
 admits freely during warmup; the housekeeping pass removes the copies
 later:
@@ -601,8 +664,8 @@ Verified end to end on a live brain:
 | `novelty_quantile` | 0.70 | the store-rate target; rate ≈ 1 − q | **the only steady-state parameter.** Tracks prediction within 3 points on 4 corpora |
 | `novelty_reservoir` | 5000 | trailing window length, 16 B/event | W ≥ 12000 lets the reservoir span a whole run; mx1 collapses to 16.5% |
 | `novelty_bar_floor` | 0.20 | minimum value for the derived bar | free below 0.348 (lowest varied bar); stops a point mass capturing the gate |
-| `novelty_warmup` | 200 | events before the quantile is trusted | the quantile is stable from ~50; 1500 was unexamined |
-| `novelty_warmup_floor` | 200 | never trust the quantile below this | a floor is needed even though it is low |
+| `novelty_warmup` | 50 | events before the quantile is trusted | the measured stability point: rate is flat from 25 to 400, so a longer warmup buys blindness, not accuracy |
+| `novelty_warmup_floor` | 50 | never trust the quantile below this | equal to the count on purpose, which is what makes the day cap inert |
 | `novelty_warmup_max_days` | 7.0 | escape from the floor | **inert by default** — equals base for any rate; live only if the floor is lowered |
 | `dedup_window` | 200 | near-duplicate comparison horizon | **known gap**: a copy arriving later than this escapes |
 | `dedup_span_seconds` | 86400 | beyond this gap, same words + same actor is a NEW event | sits inside the observed gap distribution: mx1 duplicates are all within 1h, git's recur across years |
@@ -645,20 +708,22 @@ Verified end to end on a live brain:
    prior in pure ingest. H18 learns from *retrieval*; a workload that never
    queries its own memory runs with the gain channel dead.
 
-5. **The cold start is now rate-aware, and what remains is the floor.**
-   Mitigated: the warmup is `rate × max_days`, so a slow feed drops to the
-   200-event floor rather than waiting 1500 events. Measured blind spots:
+5. **The cold start is now bounded by the floor, and the floor is 50.**
+   Mitigated: the warmup is `rate × max_days` clipped to the floor, so a
+   slow feed waits for 50 observations rather than 200 or 1500. Measured
+   blind spots:
 
-   | feed | rate | before (1500) | now |
-   |---|---|---|---|
-   | mx1 mail log | 40/min | 38 minutes | ~5 seconds |
-   | pvl visitor log | 175/day | 8.6 days | ~1 day |
-   | git commit subjects | 11.2/day | 134 days | **18 days** |
+   | feed | rate | before (1500) | then (200) | now (50) |
+   |---|---|---|---|---|
+   | mx1 mail log | 40/min | 38 minutes | ~5 seconds | ~1.3 seconds |
+   | pvl visitor log | 175/day | 8.6 days | ~1 day | ~7 hours |
+   | git commit subjects | 11.2/day | 134 days | 18 days | **4.5 days** |
 
-   Residual: a feed below ~29 events/day cannot reach the 200 floor inside
-   7 days, so it waits -- capped at 7 days of miscalibration rather than
-   unbounded. That bound is deliberate; the alternative is trusting a
-   quantile fitted on too few observations.
+   Residual: a feed below ~7.1 events/day cannot reach the 50-observation
+   floor in 7 days, so it waits — and since the floor equals the count, the
+   day cap is inert by arithmetic (§4.4), so it waits for the observations,
+   not for the days. That bound is deliberate; the alternative is trusting a
+   quantile fitted on fewer samples than the one measured as stable.
 
    The ordering inverts against intuition and is worth knowing: the corpus
    with the most events has the *shortest* blind spot, because rate is what

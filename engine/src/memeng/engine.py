@@ -181,7 +181,10 @@ class MemoryEngine:
             # stable from ~50 observations -- store rate at warmup 50/200/
             # 1500 differs by under 1.2 points across three corpora. So the
             # 1500 that shipped was not a statistical requirement, it was
-            # simply the event count nobody had questioned.
+            # simply the event count nobody had questioned. The 200 that
+            # replaced it was not queried either, and is now 50 -- the
+            # measured stability point, which is what the measurement above
+            # always pointed at.
             #
             # As a fixed count it is a DURATION in deployment and an
             # unpredictable one, because what matters is events/day:
@@ -199,13 +202,23 @@ class MemoryEngine:
             # So: clamp to a statistical FLOOR, and cap by days when the
             # observed rate is known. Below the floor the bar is not worth
             # trusting; above it, waiting longer buys nothing.
-            "novelty_warmup": 200,
-            # Never calibrate on fewer than this many observations.
-            "novelty_warmup_floor": 200,
+            #
+            # 50, not 200. The bar is the empirical q-th percentile of the
+            # reservoir, and that is stable from ~50 observations -- measured
+            # across four corpora, store rate at warmup 25/50/100/200/400 is
+            # 29.5/29.5/29.4/29.7/29.7% against a 30% target, and the bar's
+            # standard deviation is flat at 0.0012-0.0015. A longer warmup
+            # buys no accuracy; it only buys blindness. 200 was inherited
+            # from the 1500 it replaced, and the "50" was sitting in the
+            # measurements the whole time unexercised.
+            "novelty_warmup": 50,
+            # Never calibrate on fewer than this many observations. Equal to
+            # the count on purpose: see the day cap below.
+            "novelty_warmup_floor": 50,
             # ...nor wait longer than this many days for a slow feed.
             # INERT AT THE SHIPPED DEFAULTS, and that is deliberate rather
             # than accidental. Because `novelty_warmup == novelty_warmup_floor
-            # == 200`, `max(floor, min(base, rate x days))` is 200 for ANY
+            # == 50`, `max(floor, min(base, rate x days))` is 50 for ANY
             # rate -- verified from 0.1 to 1428 events/day. So the default
             # path contains NO wall-clock term at all, which is the
             # property that matters: the clock the gate runs on is a count
@@ -213,10 +226,16 @@ class MemoryEngine:
             #
             # The knob stays because it is the only escape from the floor,
             # and the floor is the one thing that cannot be derived: a feed
-            # too slow to accumulate 200 observations cannot be calibrated
+            # too slow to accumulate 50 observations cannot be calibrated
             # by any amount of waiting. Raising the floor above the count,
             # or setting max_days > 0 with a floor below the count, makes
-            # this live again. Measured trigger: rate < 200/7 = 28.6/day.
+            # this live again. Measured trigger: rate < 50/7 = 7.1/day.
+            #
+            # tau is the other candidate and it is much worse: tau accrued
+            # over the same 200 events is 87.4 (mx1) to 1174.7 (git), a 13x
+            # spread, because tau accrues from silence and the corpora have
+            # different gap structure. Events are the corpus-independent
+            # unit here, which is the opposite of what tau was meant to be.
             "novelty_warmup_max_days": 7.0,
             # Absolute minimum for the derived bar. A quantile of a
             # distribution that has collapsed onto a point mass IS that
@@ -1001,9 +1020,9 @@ class MemoryEngine:
         lengthen a warmup the brain has already served.
 
         Floor matters because below it the quantile is not worth trusting.
-        Measured stable from ~50 observations, so the floor is low -- but a
-        feed too slow to reach it inside `novelty_warmup_max_days` simply
-        waits, and that is honest rather than silently miscalibrated.
+        Measured stable from ~50 observations, so the floor sits AT 50
+        rather than above it -- a feed too slow to reach it simply waits,
+        and that is honest rather than silently miscalibrated.
         """
         cfg = self.base_cfg
         floor = max(1, int(cfg["novelty_warmup_floor"]))

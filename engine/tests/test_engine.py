@@ -1437,7 +1437,7 @@ def test_default_warmup_contains_no_wall_clock_term():
     seconds.
 
     `novelty_warmup_max_days` looks load-bearing and is not: with
-    `novelty_warmup == novelty_warmup_floor == 200`,
+    `novelty_warmup == novelty_warmup_floor`,
 
         max(floor, min(base, rate x days)) == base
 
@@ -1447,7 +1447,8 @@ def test_default_warmup_contains_no_wall_clock_term():
 
     The knob stays because it is the only escape from the floor, and the
     floor is the one thing that cannot be derived: a feed too slow to
-    accumulate 200 observations cannot be calibrated by waiting.
+    accumulate the floor's observations cannot be calibrated by waiting.
+    At the shipped 50 that is any feed below 50/7 = 7.1 events/day.
 
     This asserts the ARITHMETIC, so that raising the floor above the count
     -- which would silently make the wall clock live again -- is caught
@@ -1468,6 +1469,42 @@ def test_default_warmup_contains_no_wall_clock_term():
         assert e._effective_warmup("d:s") == base, (
             f"rate {n / 7:.1f}/day changed the warmup to "
             f"{e._effective_warmup('d:s')}")
+
+
+def test_warmup_floor_sits_at_the_measured_stability_point():
+    """The floor is 50 observations, not 200, and 50 is where the
+    measurement always pointed.
+
+    The bar is the empirical q-th percentile of the reservoir, and it is
+    stable from ~50 observations. Measured across four corpora, store rate
+    at warmup 25 / 50 / 100 / 200 / 400 is 29.5 / 29.5 / 29.4 / 29.7 /
+    29.7% against a 30% target, and the bar's standard deviation is flat
+    at 0.0012-0.0015 across that whole range. A longer warmup buys no
+    accuracy.
+
+    What a longer warmup does buy is blindness, and that is the cost being
+    paid: at 200, a feed of 11.2 events/day (git) waits 18 days before the
+    gate engages at all, running the fixed 0.55 cut the entire time.
+
+    Asserted as BEHAVIOUR -- the gate is running on its own quantile by
+    event 50 -- rather than as a constant, so the test states what it
+    means. Restoring the old 200 makes the assertion fail.
+    """
+    e, _s = mk_engine()                      # shipped defaults
+    e.register_domain("d", retention_profile="balanced")
+    e.attach_stream("d:s", "d")
+    for i in range(60):
+        e.new_event(ev([f"p{i % 5}"],
+                       {"subject_norm": f"subject {i} alpha beta",
+                        "body_text": f"body {i} gamma delta"},
+                       stream="d:s",
+                       wall=T0 + timedelta(seconds=i)))
+    assert len(e._novelty_window) >= 50, (
+        f"only {len(e._novelty_window)} observations banked at 60 events")
+    bar = e._quantile_threshold(0.5, 0.55)
+    assert bar != pytest.approx(0.55), (
+        "the gate is still on the fixed 0.55 cut after 60 events, so the "
+        "quantile has not engaged and the warmup floor is above 60")
 
 
 def test_prune_does_not_query_loop_invariants_per_episode():
