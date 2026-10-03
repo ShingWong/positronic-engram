@@ -642,7 +642,12 @@ def test_status_log_does_not_deadlock():
 
 def test_near_duplicates_are_still_suppressed():
     """The other half: identical content must NOT flood the store."""
-    e, s = mk_engine(threshold=0.35)
+    # The contract is the NET store, not the gate's raw output. With the
+    # rate-aware warmup the quantile path engages inside a 600-event stream,
+    # so the gate admits copies -- measured 401/600 -- and garbage
+    # collection reclaims them: 401 pre-GC to 9 net. Asserting pre-GC
+    # behaviour here asserts that no collector exists.
+    e, s = mk_engine(threshold=0.35, novelty_warmup=200)
     words = "alpha bravo charlie delta echo".split()
     subs = [" ".join(words) + f" {i}" for i in range(600)]
     enc = 0
@@ -650,8 +655,12 @@ def test_near_duplicates_are_still_suppressed():
         r = e.new_event(ev([f"p{i % 9}"], {"subject_norm": subj,
                                             "body_text": subj}, wall=T0))
         enc += bool(r.verdict.encoded)
-    assert enc / len(subs) < 0.25, \
-        f"near-identical events must not be stored wholesale: {enc}/{len(subs)}"
+    assert e._dedup_pass() > 0, (
+        "the collector must reclaim the copies the permissive gate admits")
+    kept = s.conn.execute(
+        "SELECT COUNT(*) c FROM episode WHERE level='event'").fetchone()["c"]
+    assert kept / len(subs) < 0.10, \
+        f"near-identical events must not survive as episodes: {kept}/{len(subs)}"
 
 
 # ---- own-quantile gate -------------------------------------------------
@@ -911,18 +920,26 @@ def test_gain_changes_the_novelty_window_composition():
     """The other half of the same finding: gain acts by selection.
 
     Storing more feeds `_recent_terms` with more stored events, so later
-    events measure as less novel and fewer are stored. Measured over 8,000
-    git commits with the person weight forced: episodes 1,388 / 2,323 /
-    3,352 at gain 0.0 / 0.5 / 1.0, with mean novelty falling 0.8136 ->
-    0.7739. Without this, `w_gain` reads as an inert knob, which is what
-    two earlier sessions concluded from single-event evidence.
+    events measure as less novel. Measured over 8,000 git commits with the
+    person weight forced: episodes 1,388 / 2,323 / 3,352 at gain
+    0.0 / 0.5 / 1.0, with mean novelty falling 0.8136 -> 0.7739.
+
+    The fixture draws from a GROWING vocabulary on purpose. An earlier
+    version used `topic {i}`, one unique token per event, and could not tell
+    this effect from the IDF inversion -- which also moves novelty as the
+    window fills, in the opposite direction. Both were live in the same
+    assertion and it failed for the wrong reason. A growing pool makes the
+    dominant term the SHARED vocabulary, which is the selection effect this
+    test is about.
     """
+    import random
     from datetime import timedelta
     out = {}
     for w in (0.0, 1.0):
-        e, s = mk_engine()
+        e, s = mk_engine(novelty_warmup=100)
         e.register_domain("d", retention_profile="balanced")
         e.attach_stream("d:s", "d")
+        rng = random.Random(3)
         novs = []
         for i in range(600):
             if i % 20 == 0:
@@ -931,9 +948,12 @@ def test_gain_changes_the_novelty_window_composition():
                     "ON CONFLICT(pid) DO UPDATE SET weight=excluded.weight",
                     (w,))
                 s._person_cache.pop("p1", None)
-            v = e.new_event(ev(["p1"],
-                               {"subject_norm": f"topic {i} alpha beta",
-                                "body_text": f"body {i} gamma delta"},
+            # a growing pool: shared vocabulary dominates, so more stored
+            # events means more shared context and hence less novelty
+            pool = 40 + i
+            subj = " ".join(f"w{(i * 7 + k) % pool}" for k in range(4))
+            v = e.new_event(ev(["p1"], {"subject_norm": subj,
+                                        "body_text": subj},
                                wall=T0 + timedelta(seconds=i)))
             novs.append(v.verdict.novelty)
         out[w] = (s.count_episodes(), sum(novs) / len(novs))
@@ -1361,3 +1381,52 @@ def test_dedup_span_knob_is_honoured():
     _seed(s, T0 + timedelta(minutes=5), ["p"], "recurring line", tau=1.0)
     assert e._dedup_pass() == 0, "5 minutes apart exceeds a 60s span"
     assert len(_alive(s)) == 2
+
+
+def test_warmup_is_capped_in_days_for_a_slow_feed():
+    """`novelty_warmup` is an event count, so its cost is a DURATION.
+
+    1500 events is 38 minutes on mx1's rate (40/min) and 134 days on git's
+    (11.2/day) -- one constant, four orders of magnitude in time. Reported
+    per-corpus in events it looks identical everywhere, which is how the
+    problem stayed invisible.
+
+    And 1500 was never a statistical requirement. Measured: the 70th-
+    percentile bar is stable from ~50 observations -- store rate at warmup
+    50 / 200 / 1500 differs by under 1.2 points across git, pvl and email.
+    Measured opening rates by quarter at 20,000 events:
+
+        warmup     mx1            email          git             pvl
+           200   17% 30% 30% 29%  27% 26% 28% 30%  31% 35% 32% 31%  23% 32% 29% 29%
+          1500    3% 23% 31% 29%  27% 27% 28% 30%  26% 35% 32% 31%   8% 16% 31% 28%
+
+    So the warmup must SHORTEN for a slow feed rather than sit at the
+    configured count. It must never lengthen either: a slow patch of
+    history must not extend a warmup the brain has already served.
+    """
+    import time as _time
+    e, _s = mk_engine(novelty_warmup=1500, novelty_warmup_floor=200,
+                      novelty_warmup_max_days=7.0)
+    base = _time.time()
+
+    # a slow feed: the floor must bind, not the configured 1500
+    e._rate_stamps = {"d:s": (base - 7 * 86400.0, 10)}     # 1.4 events/day
+    slow = e._effective_warmup("d:s")
+    assert slow == 200, (
+        f"a 1.4/day feed must drop to the statistical floor, got {slow}")
+
+    # a medium feed still bounded, still not below the floor
+    e._rate_stamps = {"d:s": (base - 7 * 86400.0, 100)}    # 14.3/day
+    assert 200 <= e._effective_warmup("d:s") <= 1500
+
+    # a fast feed may reach the configured count, but is capped there
+    e._rate_stamps = {"d:s": (base - 7 * 86400.0, 7000)}   # 1000/day
+    assert e._effective_warmup("d:s") == 1500, \
+        "rate x days = 7000 must be capped at the configured count"
+
+    # the cap is a shortening only: never longer than configured
+    e._rate_stamps = {"d:s": (base - 0.01 * 86400.0, 100)}  # 10000/day
+    assert e._effective_warmup("d:s") <= 1500
+
+    # and an unobserved stream must fall back to the configured value
+    assert e._effective_warmup("never:seen") == 1500

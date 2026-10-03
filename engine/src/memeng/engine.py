@@ -174,7 +174,33 @@ class MemoryEngine:
             # distribution: mx1's duplicates are all within one hour, while
             # git's recur across years.
             "dedup_span_seconds": 86400,
-            "novelty_warmup": 1500,
+            # Warmup is RATE-AWARE. Measured: the 70th-percentile bar is
+            # stable from ~50 observations -- store rate at warmup 50/200/
+            # 1500 differs by under 1.2 points across three corpora. So the
+            # 1500 that shipped was not a statistical requirement, it was
+            # simply the event count nobody had questioned.
+            #
+            # As a fixed count it is a DURATION in deployment and an
+            # unpredictable one, because what matters is events/day:
+            #
+            #     feed       rate        1500 events
+            #     mx1        40/min          38 minutes
+            #     pvl       175/day         8.6 days
+            #     git        11.2/day      134 days
+            #
+            # pvl is worse still, because the rate DURING warmup is below the
+            # corpus average: measured opening rates by twentieth show
+            # warmup=1500 sitting at 9-11% for 5,800 events, which at 175/day
+            # is 33 days, not 8.6.
+            #
+            # So: clamp to a statistical FLOOR, and cap by days when the
+            # observed rate is known. Below the floor the bar is not worth
+            # trusting; above it, waiting longer buys nothing.
+            "novelty_warmup": 200,
+            # Never calibrate on fewer than this many observations.
+            "novelty_warmup_floor": 200,
+            # ...nor wait longer than this many days for a slow feed.
+            "novelty_warmup_max_days": 7.0,
             # Absolute minimum for the derived bar. A quantile of a
             # distribution that has collapsed onto a point mass IS that
             # point mass, which made the gate store 100% of mx1's
@@ -219,6 +245,10 @@ class MemoryEngine:
         # instead of the oldest, biasing the bar upward -- measured as mx1
         # collapsing to 4.6% where the deque-based version gave 32.2%.
         self._novelty_window: list[float] = []
+        # First wall stamp and event count per stream, so the warmup can be
+        # expressed in DAYS rather than as a bare event count. The stream
+        # table only kept `last_event_wall`, which cannot yield a rate.
+        self._rate_stamps: dict[str, tuple[float, int]] = {}
         self._novelty_seen: deque[float] = deque()
 
         # ── retention profiles: application-controlled forgetting ─────────
@@ -449,7 +479,8 @@ class MemoryEngine:
             # once enough history exists. Expressed in SCORE space because
             # that is what the gate compares against -- the novelty
             # equivalent of a score cut c is (c - w_gain*gain)/w_novelty.
-            threshold = self._quantile_threshold(gain, cfg["threshold"])
+            threshold = self._quantile_threshold(gain, cfg["threshold"],
+                                                  event.stream)
             encoded = (score >= threshold
                        or arousal >= cfg["burst_threshold"])
 
@@ -464,6 +495,8 @@ class MemoryEngine:
             # novelty being fitted.
             bisect.insort(self._novelty_window, novelty)
             self._novelty_seen.append(novelty)
+            _f, _c = self._rate_stamps.get(event.stream, (0.0, 0))
+            self._rate_stamps[event.stream] = (_f or time.time(), _c + 1)
             if len(self._novelty_seen) > self._novelty_capacity:
                 stale = self._novelty_seen.popleft()
                 i = bisect.bisect_left(self._novelty_window, stale)
@@ -937,7 +970,41 @@ class MemoryEngine:
         # novelty of 2.2e-16 where "identical" should mean exactly 0.
         return round(max(0.0, min(1.0, 1.0 - best)), 9)
 
-    def _quantile_threshold(self, gain: float, fallback: float) -> float:
+    def _effective_warmup(self, stream: str | None) -> int:
+        """Events needed before the quantile is trusted, capped in DAYS.
+
+        A fixed event count is an unpredictable duration. 1500 events is 38
+        minutes on mx1's measured rate (40/min) and 134 days on git's
+        (11.2/day) -- so a constant that looks identical in event space
+        spans four orders of magnitude in time.
+
+        Capped by days divided by the stream's OWN observed rate, and never
+        raised above the configured count: a slow patch of history must not
+        lengthen a warmup the brain has already served.
+
+        Floor matters because below it the quantile is not worth trusting.
+        Measured stable from ~50 observations, so the floor is low -- but a
+        feed too slow to reach it inside `novelty_warmup_max_days` simply
+        waits, and that is honest rather than silently miscalibrated.
+        """
+        cfg = self.base_cfg
+        floor = max(1, int(cfg["novelty_warmup_floor"]))
+        base = max(floor, int(cfg["novelty_warmup"]))
+        days = float(cfg["novelty_warmup_max_days"])
+        if days <= 0 or not stream:
+            return base
+        first, count = self._rate_stamps.get(stream, (0.0, 0))
+        now = time.time()
+        if not first:
+            self._rate_stamps[stream] = (now, 1)
+            return base
+        elapsed_days = (now - first) / 86400.0
+        if elapsed_days <= 0 or count < 1:
+            return base
+        return max(floor, min(base, int(count / elapsed_days * days)))
+
+    def _quantile_threshold(self, gain: float, fallback: float,
+                           event_stream: str | None = None) -> float:
         """The store threshold: a quantile of this brain's OWN novelty.
 
         Below `novelty_warmup` events the reservoir is too small to fit a
@@ -964,7 +1031,7 @@ class MemoryEngine:
         # `not window` as well: with novelty_warmup <= 0 the comparison
         # alone passes on the first event and the index below raises
         # IndexError on an empty list.
-        if not window or len(window) < int(cfg["novelty_warmup"]):
+        if not window or len(window) < self._effective_warmup(event_stream):
             return float(fallback)
         q = float(cfg["novelty_quantile"])
         bar = window[min(len(window) - 1, int(q * (len(window) - 1)))]
