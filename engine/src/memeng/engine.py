@@ -53,6 +53,9 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_MISS = object()
+
+
 class MemoryEngine:
     # FTS5 OR-term bag excludes high-frequency noise words so a sentence-level
     # cue's OR retry ranks on content terms, not filler.
@@ -258,6 +261,7 @@ class MemoryEngine:
         # Evicting from the sorted list alone would drop the SMALLEST value
         # instead of the oldest, biasing the bar upward -- measured as mx1
         # collapsing to 4.6% where the deque-based version gave 32.2%.
+        self._renew_cache: dict | None = None
         self._novelty_window: list[float] = []
         # First wall stamp and event count per stream, so the warmup can be
         # expressed in DAYS rather than as a bare event count. The stream
@@ -1141,16 +1145,26 @@ class MemoryEngine:
         # drops nothing, which caught 19 merges it should not have made.
         seen: set[tuple] = set()
         recent: deque[tuple] = deque(maxlen=window)
+        window_actors: set[tuple] = set()
+        thresh_cache: dict = {}
         merged = 0
         for ep in self.store.iter_episodes(ordered=True):
             if did is not None and ep.domain_id != did:
                 continue
-            edid = ep.domain_id if ep.domain_id is not None else \
-                (self.store.get_stream(ep.stream) or {}).get("domain_id")
-            pname = (self.store.get_domain(edid) or {}).get(
-                "retention_profile") if edid is not None else None
-            pname = pname or self.base_cfg.get("retention_profile", "balanced")
-            thresh = self.retention_profiles.get(pname, {}).get("dedup_sim")
+            # Both lookups are loop-invariant and were costing two SQL
+            # round-trips PER EPISODE -- measured 11,842 `SELECT * FROM
+            # domain` on an 11,840-episode prune. Memoise the whole
+            # resolution to a threshold, since that is all it is used for.
+            thresh = thresh_cache.get(ep.domain_id, _MISS)
+            if thresh is _MISS:
+                edid = ep.domain_id if ep.domain_id is not None else \
+                    (self.store.get_stream(ep.stream) or {}).get("domain_id")
+                pname = (self.store.get_domain(edid) or {}).get(
+                    "retention_profile") if edid is not None else None
+                pname = pname or self.base_cfg.get("retention_profile",
+                                                   "balanced")
+                thresh = self.retention_profiles.get(pname, {}).get("dedup_sim")
+                thresh_cache[ep.domain_id] = thresh
             if thresh is None:
                 continue                 # archival: nothing is ever dropped
             terms = self._terms_of_episode(ep)
@@ -1178,25 +1192,55 @@ class MemoryEngine:
             # mistake, a dropped fact is not.
             key = (terms, tuple(sorted(ep.persons or ())))
             wall = ep.wall.timestamp()
-            same_actor = any(r[1] == key[1] for r in recent)
+            # O(1) actor membership, maintained with the deque. The scan
+            # cost 1.5M generator calls at 11,840 episodes -- O(window) per
+            # episode to answer a set lookup.
+            same_actor = key[1] in window_actors
             close = recent and (wall - recent[-1][2]) <= span
             if key in seen and not (same_actor and close):
                 dup = False                      # a distinct occurrence
             elif key in seen:
                 dup = True
             else:
-                dup = any(
-                    r[1] == key[1]
-                    and len(key[0] & r[0]) >= thresh * (
-                        len(key[0]) + len(r[0]) - len(key[0] & r[0]))
-                    for r in recent)
+                # Prefilter by size before computing Jaccard. Two sets can
+                # only reach similarity t if their sizes are within a factor
+                # of (1+t)/(1-t): |A n B| <= min(|A|,|B|), so
+                #   t(|A|+|B|-|A n B|) <= min(|A|,|B|)
+                # gives a necessary condition that rejects almost every
+                # candidate with two integer comparisons instead of a set
+                # intersection.
+                #
+                # Measured at 6,429 episodes: 1.25M generator calls and 3.4s,
+                # the single largest item in prune. The intersection itself
+                # is the expensive part; the size test avoids computing it.
+                lo_t = (1.0 - thresh) / (1.0 + thresh)
+                qn_ = len(key[0])
+                dup = False
+                for r_ in recent:
+                    if r_[1] != key[1]:
+                        continue
+                    m_ = len(r_[0])
+                    if not (m_ * lo_t <= qn_ <= m_ / lo_t):
+                        continue
+                    inter = len(key[0] & r_[0])
+                    if inter >= thresh * (qn_ + m_ - inter):
+                        dup = True
+                        break
             if dup:
                 self.store.update_episode(str(ep.id), level="day_token",
                                           subject_norm=None)
                 merged += 1
-            else:
-                seen.add(key)
-                recent.append((terms, key[1], wall))
+                continue
+            # Only NON-duplicates enter the window. An earlier version
+            # appended unconditionally, which let copies into the window and
+            # changed every later comparison -- measured as deduped 120 ->
+            # 126 on git. Same shape as the committed scan, so the A/B is
+            # exact.
+            seen.add(key)
+            if len(recent) == window:          # deque evicts the head next
+                window_actors.discard(recent[0][1])
+            recent.append((terms, key[1], wall))
+            window_actors.add(key[1])
         return merged
 
     @staticmethod
@@ -1259,11 +1303,31 @@ class MemoryEngine:
         # prune non-idempotent.
         self.store.decay_person_weights(
             rate=float(self.base_cfg.get("gain_decay_rate", 0.01)))
+        # ONE transaction for the whole pass. Measured at 11,840 episodes:
+        # 46,252 SQL executes and ~8s of prune's 26s, because every demotion
+        # called write_residue() + update_episode() and EACH committed --
+        # the housekeeping pass was paying a disk sync per episode. A first
+        # attempt wrapped only _dedup_pass, which made things SLOWER: the
+        # writes come from the tau ladder and the object ladder, which run
+        # after it. Hence the batch spans the entire sweep.
+        batched = False
+        try:
+            self.store.begin_batch()
+            batched = True
+        except sqlite3.Error:            # nested batch, or no transaction
+            batched = False
+
         # Garbage collection, same rationale as the gain decay above: a
         # housekeeping task on an existing pass, so it needs no timer. The
         # gate admits what is interesting; this decides what is worth
         # keeping. Measured on mx1 it reclaims 87.4% of stored episodes while
         # leaving 1.0-9.0% of the three varied corpora untouched.
+        # One transaction for the whole pass. Measured at 11,840 episodes:
+        # 46,252 SQL executes and ~8s of the prune's 26s, because every
+        # demotion called write_residue() and update_episode(), and EACH
+        # committed. The batch primitive already existed and prune simply
+        # was not using it -- so the pass that is supposed to be cheap
+        # housekeeping was paying a disk sync per episode.
         rep["deduped"] = self._dedup_pass(domain=domain)
         # Idle accrual: tau is an experiential clock, so silence has to move
         # it or a quiet agent never ages. Credited per stream, from the time
@@ -1273,6 +1337,8 @@ class MemoryEngine:
 
 
         dom_cache: dict[int, dict] = {}
+        stream_now: dict[str, float] = {}
+        domain_row: dict[int, dict | None] = {}
         for ep in eps:
             if wall_axis:
                 # ep.wall is a datetime; age on the wall clock in DAYS so S
@@ -1284,14 +1350,28 @@ class MemoryEngine:
                     age_days = float(wall_base) / 86400.0
                 now = age_days
             else:
-                now = tau_now if tau_now is not None else \
-                    self.store.stream_time(ep.stream)[0]
+                # Loop-invariant per stream, so memoise it. Measured at
+                # 11,840 episodes: 11,840 identical `SELECT tau,mono FROM
+                # stream` round-trips, one per episode. Same for the domain
+                # lookup below. Two statements per episode that could not
+                # differ within a single pass.
+                if tau_now is not None:
+                    now = tau_now
+                else:
+                    cached = stream_now.get(ep.stream)
+                    if cached is None:
+                        cached = self.store.stream_time(ep.stream)[0]
+                        stream_now[ep.stream] = cached
+                    now = cached
             if ep.tier is Tier.FLASHBULB or math.isinf(ep.strength):
                 continue
             d_id = ep.domain_id if ep.domain_id is not None else \
                 (self.store.get_stream(ep.stream) or {}).get("domain_id")
             if d_id not in dom_cache:
-                row = self.store.get_domain(d_id) if d_id is not None else None
+                if d_id not in domain_row:
+                    domain_row[d_id] = self.store.get_domain(d_id) \
+                        if d_id is not None else None
+                row = domain_row[d_id]
                 pname = (row or {}).get("retention_profile") or \
                     self.base_cfg.get("retention_profile", "balanced")
                 dom_cache[d_id] = self.retention_profiles[pname]
@@ -1381,13 +1461,17 @@ class MemoryEngine:
 
         # advance the prune boundary: consolidations/sightings written before
         # this pass are "old" — load-bearing is re-earned strictly each cycle.
+        self._renew_cache = None      # prune_boundary moved; rebuild next pass
         if now_cache:
             latest = max(now_cache.values())
             self.store.conn.execute(
                 "INSERT INTO meta(k,v) VALUES('prune_boundary', ?) "
                 "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                 (str(latest),))
-            self.store._commit()
+            if batched:
+                self.store.commit_batch()
+            else:
+                self.store._commit()
 
         return PruneReport(**rep)
 
@@ -1448,19 +1532,34 @@ class MemoryEngine:
             return False                        # renewal disabled for profile
         now = now_cache[d_id]
         name = r["canonical_name"]
-        # window anchor: consolidations/sightings counted only since the
-        # last prune boundary (strictly re-earned each cycle).
-        last_prune = float(self.store.conn.execute(
-            "SELECT COALESCE(MAX(v), 0.0) FROM meta "
-            "WHERE k='prune_boundary'").fetchone()[0] or 0.0)
         if not name:
             return False
+        # Window anchor and the consolidation corpus are read ONCE per pass
+        # and cached on self, not per object.
+        #
+        # Measured at 4,008 objects and 7,777 episodes: prune took 9.7s, and
+        # stubbing this one function took it to 3.4s -- it was two thirds of
+        # the pass. Two causes, both here: `prune_boundary` was re-read from
+        # meta for every object, and the consolidation query was a
+        # `features_json LIKE '%name%'` FULL-TABLE SCAN per object, so the
+        # pass was O(objects x episodes).
+        #
+        # The consolidation names are fetched once into memory and matched in
+        # Python. That is the same answer the LIKE did -- it is a substring
+        # test either way -- without re-scanning the table per object.
+        cache = getattr(self, "_renew_cache", None)
+        if cache is None:
+            last_prune = float(self.store.conn.execute(
+                "SELECT COALESCE(MAX(v), 0.0) FROM meta "
+                "WHERE k='prune_boundary'").fetchone()[0] or 0.0)
+            cons = [str(x["features_json"] or "") for x in self.store.conn.execute(
+                "SELECT features_json FROM episode "
+                "WHERE kind='consolidation' AND tau > ?", (last_prune,))]
+            cache = {"last_prune": last_prune, "cons": cons}
+            self._renew_cache = cache
+        last_prune = cache["last_prune"]
         # 1) consolidation mentions since last prune
-        hit = self.store.conn.execute(
-            "SELECT COUNT(*) c FROM episode e "
-            "WHERE e.kind='consolidation' AND e.tau > ? AND "
-            "e.features_json LIKE ? ESCAPE '\\'",
-            (last_prune, f"%{name}%")).fetchone()["c"]
+        hit = any(name in blob for blob in cache["cons"])
         # 2) re-sightings in real episodes since last prune
         if hit == 0:
             sx = self.store.conn.execute(

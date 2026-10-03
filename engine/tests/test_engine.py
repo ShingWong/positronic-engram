@@ -1468,3 +1468,59 @@ def test_default_warmup_contains_no_wall_clock_term():
         assert e._effective_warmup("d:s") == base, (
             f"rate {n / 7:.1f}/day changed the warmup to "
             f"{e._effective_warmup('d:s')}")
+
+
+def test_prune_does_not_query_loop_invariants_per_episode():
+    """prune() must not issue a SQL round-trip per episode.
+
+    Measured at 11,840 episodes: 58,909 statements, of which 11,842 were
+    `SELECT * FROM domain` and 11,840 were `SELECT tau,mono FROM stream`.
+    Every one of them was loop-invariant -- the domain and the stream tau
+    cannot change within a single pass -- so the pass was paying two
+    round-trips per episode to learn facts it already had.
+
+    Asserted on statement COUNTS rather than wall time, because wall time
+    on this machine varies 11.0-14.7s for identical work. A time-based
+    assertion would pass or fail for reasons that have nothing to do with
+    the code.
+    """
+    import collections
+
+    class Spy:
+        """Counts statements. sqlite3.Connection.execute is read-only, so
+        the connection object is wrapped rather than patched."""
+        def __init__(self, real):
+            self.real = real
+            self.c = collections.Counter()
+
+        def execute(self, sql, *a, **k):
+            self.c[" ".join(str(sql).split())[:40]] += 1
+            return self.real.execute(sql, *a, **k)
+
+        def __getattr__(self, name):
+            return getattr(self.real, name)
+
+    e, s = mk_engine()
+    e.register_domain("d", retention_profile="balanced")
+    e.attach_stream("d:s", "d")
+    from datetime import timedelta
+    for i in range(400):
+        e.new_event(ev([f"p{i % 7}"], {"subject_norm": f"topic {i} alpha beta",
+                                        "body_text": f"body {i} gamma"},
+                       wall=T0 + timedelta(seconds=i)))
+    real = s.conn
+    spy = Spy(real)
+    s.conn = spy
+    try:
+        e.prune()
+    finally:
+        s.conn = real
+    per_episode = max(
+        (v for k, v in spy.c.items()
+         if k.startswith("SELECT * FROM domain")
+         or k.startswith("SELECT tau,mono FROM stream")),
+        default=0)
+    live = spy.c.get("SELECT * FROM episode WHERE level=?", 1)
+    assert per_episode <= 4, (
+        f"a loop-invariant lookup ran {per_episode} times across {live} "
+        f"episodes; it must be memoised, not repeated")
