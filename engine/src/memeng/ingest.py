@@ -329,6 +329,17 @@ def ingest_records(engine, schema: dict, records: Iterable[dict], *,
         feats["message_ids"] = id_lists[n]
         feats["event_class"] = classes[bi]
         feats["arousal"] = arousals[n]
+        # The engine reads exactly three feature keys -- arousal,
+        # subject_norm, body_text -- and everything else is stored and never
+        # read. Passing the record without speaking those keys repeats the
+        # flattening defect in a new shirt: fields present but unread, while
+        # novelty, dedup and fusion-text all run blind. The schema's content
+        # field is the text; 304k silent visits scored ~0.55 on the empty
+        # fallback and encoded freely, which is how a 40-minute ingest of
+        # nothing-to-say happened.
+        text = str(r.get(content_field) or "") if content_field else ""
+        feats["subject_norm"] = text
+        feats["body_text"] = text
         objs = (([(SESSION_KIND, canonicals[n])] if canonicals[n] else [])
                 + [(MESSAGE_KIND, f"queue:{m}") for m in id_lists[n]])
         if g is not None:

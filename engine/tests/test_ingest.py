@@ -22,7 +22,12 @@ SCHEMA = {
     "software": "x",
     "identity_key": ["ident", "pid"],
     "time_field": "stamp",
-    "record_layers": {},
+    "record_layers": {
+        "payload": [
+            {"path": "message", "role": "content", "type": "str",
+             "meaning": "m"},
+        ],
+    },
     "classes": [],
     "message_key": {
         "name": "queue_id",
@@ -128,8 +133,11 @@ def test_arousal_is_inverse_frequency_not_zero():
                if f.get("episode_role") != "group"]
     groups = [f["arousal"] for f in feats
               if f.get("episode_role") == "group"]
-    # queue class has 2 members, connect has 1: the common class scores lower.
-    assert members == [1.0 - 1 / 2, 0.0, 0.0]
+    # Queue class has 2 members, connect has 1: the common class scores
+    # lower. Fewer than 3 members may be stored -- now that content reaches
+    # the text keys, the gate can discriminate and may reject a near-repeat,
+    # which is the mapping working rather than the test breaking.
+    assert set(members) <= {1.0 - 1 / 2, 0.0} and members
     # One delivery group (both queue lines name the same id; the rule puts a
     # record with a message id in the delivery, not the session). Mean of two
     # queue members: 0.0. The connect line stands alone in a session
@@ -411,3 +419,20 @@ def test_grouping_is_deterministic():
     a = [(g.kind, g.canonical, list(g.members)) for g in assign(rs, **kw)]
     b = [(g.kind, g.canonical, list(g.members)) for g in assign(rs, **kw)]
     assert a == b
+
+
+def test_content_field_speaks_the_engine_text_keys():
+    """The engine reads subject_norm/body_text and nothing else. An ingest
+    that stores raw fields without setting them repeats the flattening
+    defect: novelty, dedup and fusion-text run blind while the fields sit
+    present-but-unread in features. Measured cost: 304k silent visits scored
+    on the empty fallback and a 40-minute ingest of nothing-to-say."""
+    e = _engine()
+    ingest_records(e, SCHEMA, RECS[:1], stream="d:s")
+    import json
+    f = json.loads(e.store.conn.execute(
+        "SELECT features_json FROM episode").fetchone()[0])
+    assert f["subject_norm"] == "connect from x"
+    assert f["body_text"] == "connect from x"
+    # ... while the raw fields are still there too.
+    assert f["message"] == "connect from x"

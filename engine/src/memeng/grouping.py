@@ -82,6 +82,11 @@ def assign(records: list[dict], *, session_of, messages_of, wall_of,
     open_groups: dict[str, Group] = {}
     done: list[Group] = []
     seq_of: dict[str, int] = {}
+    # Closed group identities. The flush below must not re-add a group that
+    # split or rotated out of `open_groups`; testing membership by scanning
+    # `done` is O(open x done) -- measured as a hang (zero progress, flat
+    # RSS) on 100k single-visit groups, roughly 30 billion comparisons.
+    closed_ids: set[int] = set()
 
     def current(key: str, kind: str, wall: datetime) -> Group:
         g = open_groups.get(key)
@@ -92,6 +97,7 @@ def assign(records: list[dict], *, session_of, messages_of, wall_of,
                     g.span_seconds <= max_span_seconds and \
                     len(g.members) < max_lines:
                 return g
+            closed_ids.add(id(g))
             # Split: same key, new group. The old one is done. first_wall is
             # left unset so the current record sets it -- carrying the old
             # group's start would inflate the new span and re-split at once.
@@ -102,6 +108,7 @@ def assign(records: list[dict], *, session_of, messages_of, wall_of,
             return nxt
         if g is not None:
             done.append(g)
+            closed_ids.add(id(g))
         # A split key keeps counting across splits AND reopenings: the third
         # visit to a key is #3 whether the second group closed by gap or by
         # cap. Tracked in a dict, not scanned, so 10,000 groups do not cost
@@ -133,8 +140,7 @@ def assign(records: list[dict], *, session_of, messages_of, wall_of,
             g.first_wall = wall
         g.last_wall = wall
 
-    done.extend(g for g in open_groups.values()
-                if not any(d is g for d in done))
+    done.extend(g for g in open_groups.values() if id(g) not in closed_ids)
     # Deterministic order: first appearance in the file.
     done.sort(key=lambda g: min(g.members) if g.members else 0)
     return done
