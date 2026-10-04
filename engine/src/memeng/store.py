@@ -931,28 +931,96 @@ class SQLiteStore:
                 if f"{r['kind']}:{r['canonical_name']}" in want]
 
     def episodes_for_objects(self, *, domain_id: int, refs,
-                                 limit: int = 100) -> list[str]:
-        """Episode ids seen through the named objects, newest first.
+                                 limit: int = 100,
+                                 since: str | None = None,
+                                 until: str | None = None,
+                                 newest_first: bool = True) -> list[str]:
+        """Episode ids seen through the named objects.
 
         The object-identity retrieval channel: a cue naming a message gets
         every episode of that message's life, with zero text overlap required.
         This is the query the whole message axis exists to answer.
+
+        `since`/`until` are ISO wall bounds ("Tuesday afternoon" is a range,
+        not a ranking). Newest-first is the default because recall serves the
+        recent past; ingestion-time walks pass newest_first=False for
+        chronological replay.
         """
         oids = self.object_ids_for_refs(domain_id=domain_id, refs=refs)
         if not oids:
             return []
-        rows = self.conn.execute(
-            "SELECT DISTINCT g.episode_id FROM object_sighting g "
-            "JOIN episode e ON e.id = g.episode_id "
-            "WHERE g.object_id IN ({o}) ORDER BY e.wall DESC LIMIT ?"
-            .format(o=",".join("?" * len(oids))),
-            (*oids, limit)).fetchall()
+        q = ("SELECT DISTINCT g.episode_id FROM object_sighting g "
+             "JOIN episode e ON e.id = g.episode_id "
+             "WHERE g.object_id IN ({o})".format(o=",".join("?" * len(oids))))
+        args: list = list(oids)
+        if since is not None:
+            q += " AND e.wall >= ?"
+            args.append(since)
+        if until is not None:
+            q += " AND e.wall <= ?"
+            args.append(until)
+        q += " ORDER BY e.wall DESC LIMIT ?" if newest_first else \
+            " ORDER BY e.wall ASC LIMIT ?"
+        args.append(limit)
+        rows = self.conn.execute(q, args).fetchall()
         return [str(r[0]) for r in rows]
+
+    def episodes_in_range(self, *, stream: str | None = None,
+                            domain_id: int | None = None,
+                            since: str | None = None,
+                            until: str | None = None,
+                            limit: int = 1000) -> list[str]:
+        """Episode ids in a wall-clock window, oldest first.
+
+        Range-and-key first, similarity second: four of the six log motives
+        open with a time window, and a window is a bound, not a ranking.
+        Oldest-first because a window is read as a narrative, and a narrative
+        starts at the beginning.
+        """
+        q = "SELECT id FROM episode WHERE level='event'"
+        args: list = []
+        if stream is not None:
+            q += " AND stream=?"
+            args.append(stream)
+        if domain_id is not None:
+            q += " AND domain_id=?"
+            args.append(domain_id)
+        if since is not None:
+            q += " AND wall >= ?"
+            args.append(since)
+        if until is not None:
+            q += " AND wall <= ?"
+            args.append(until)
+        q += " ORDER BY wall ASC LIMIT ?"
+        args.append(limit)
+        return [str(r[0]) for r in self.conn.execute(q, args).fetchall()]
 
     def all_object_domains(self) -> list[int]:
         rows = self.conn.execute(
             "SELECT DISTINCT domain_id FROM object").fetchall()
         return [int(r[0]) for r in rows]
+
+    def carried_counterparts(self, object_id: str) -> dict:
+        """Both ends of the handoff, for the "what happened" answer.
+
+        Returns {"carried_by": [...], "carried": [...]} as object rows: for a
+        message, the sessions that handled it; for a session, the messages it
+        handled. The predicate is fixed because it is the only relation the
+        store writes so far; when a second predicate exists this grows a
+        parameter instead of a second method.
+        """
+        by = self.conn.execute(
+            "SELECT o.* FROM object_relation r JOIN object o "
+            "ON o.id = r.subject_id "
+            "WHERE r.object_id=? AND r.predicate='carried'",
+            (object_id,)).fetchall()
+        mine = self.conn.execute(
+            "SELECT o.* FROM object_relation r JOIN object o "
+            "ON o.id = r.object_id "
+            "WHERE r.subject_id=? AND r.predicate='carried'",
+            (object_id,)).fetchall()
+        return {"carried_by": [dict(r) for r in by],
+                "carried": [dict(r) for r in mine]}
 
     def honor_objects(self, object_ids, *, weight: float = 0.01) -> None:
         """Retrieval credit for objects, mirroring honor_persons."""

@@ -1388,6 +1388,75 @@ class MemoryEngine:
             t for t in _re.split(r"[^\w]+", txt)
             if (len(t) > 1 or t.isdigit()) and t not in MemoryEngine._FTS_STOP)
 
+    def recall_object(self, kind: str, canonical: str, *,
+                      stream: str | None = None,
+                      since: str | None = None,
+                      until: str | None = None,
+                      limit: int = 100) -> dict:
+        """Range-and-key lookup: the episodes of one thing in one window.
+
+        Not ranked recall -- there is no similarity here and none is wanted.
+        A customer asking "what happened to my message" names an identity and
+        optionally a window; the answer is every episode of that identity's
+        life in wall order, plus the handoffs (which sessions carried this
+        message, which messages this session carried). Unknown identity is an
+        empty answer with the name echoed, not an error: absence is
+        information, and an error would read as a system failure rather than
+        a fact about the data.
+        """
+        did = None
+        if stream is not None:
+            srow = self.store.get_stream(stream) or {}
+            did = srow.get("domain_id")
+        domains = [int(did)] if did is not None \
+            else self.store.all_object_domains()
+        obj = None
+        for dd in domains:
+            obj = self.store.find_object(domain_id=int(dd), kind=kind,
+                                         canonical_name=canonical)
+            if obj is not None:
+                did = dd
+                break
+        if obj is None:
+            return {"kind": kind, "canonical": canonical, "found": False,
+                    "episodes": [], "carried_by": [], "carried": []}
+        eids = self.store.episodes_for_objects(
+            domain_id=int(did), refs=[f"{kind}:{canonical}"],
+            limit=limit, since=since, until=until, newest_first=False)
+        eps = []
+        for eid in eids:
+            ep = self.store.get_episode(eid)
+            if ep is None:
+                continue
+            feats = ep.features or {}
+            # Text fallbacks, in order. Schema-ingested records carry the
+            # raw fields (a syslog record has `message`, not `body_text`),
+            # so a lookup that only reads the engine's own field names
+            # returns empty strings for the corpora that need it most.
+            text = (feats.get("body_text") or feats.get("message")
+                    or feats.get("text") or "")
+            eps.append({
+                "episode_id": eid,
+                "wall": ep.wall.isoformat(),
+                "tau": ep.tau,
+                "stream": ep.stream,
+                "subject": ep.subject_norm or text[:60],
+                "snippet": text[:200],
+                "class": feats.get("event_class"),
+                "object_refs": feats.get("object_refs") or [],
+            })
+        links = self.store.carried_counterparts(str(obj["id"]))
+        return {
+            "kind": kind, "canonical": canonical, "found": True,
+            "salience": obj.get("salience"),
+            "first_seen": obj.get("first_seen_wall"),
+            "last_seen": obj.get("last_seen_wall"),
+            "episodes": eps,
+            "carried_by": [r["canonical_name"]
+                           for r in links["carried_by"]],
+            "carried": [r["canonical_name"] for r in links["carried"]],
+        }
+
     def prune(self, tau_now: float | None = None, *,
               domain: str | None = None,
               decay_axis: str = "tau",

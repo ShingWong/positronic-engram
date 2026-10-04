@@ -245,3 +245,86 @@ def test_prune_decays_object_salience():
         domain_id=_did(e), kind="session",
         canonical_name="s:7")["salience"])
     assert after == 0.5 + (before - 0.5) * 0.5
+
+
+# ------------------------------------------------- range-and-key recall
+
+def test_recall_object_returns_a_message_life_in_order():
+    # Maximally distinct wording per record: near-identical texts would be
+    # gate-rejected on novelty before recall ever saw them, which is correct
+    # gate behavior and not what this test is about.
+    e = _engine()
+    for objs, txt in (([("session", "s:1"), ("message", "queue:Q9")],
+                       "queue manager accepted the parcel"),
+                      ([("session", "s:2"), ("message", "queue:Q9")],
+                       "antivirus verdict arrived clean"),
+                      ([("session", "s:2"), ("message", "queue:Q9")],
+                       "mailbox write finished at dawn")):
+        r = e.new_event(_ev(objects=objs, text=txt))
+        assert r.verdict.encoded, txt
+    e.new_event(_ev(text="unrelated weather discussion today"))
+    # The ingest path writes carried edges; here the event path does not, so
+    # write the two the scenario needs the way ingest would.
+    did = _did(e)
+    s1 = e.store.find_object(domain_id=did, kind="session",
+                             canonical_name="s:1")["id"]
+    s2 = e.store.find_object(domain_id=did, kind="session",
+                             canonical_name="s:2")["id"]
+    m = e.store.find_object(domain_id=did, kind="message",
+                            canonical_name="queue:Q9")["id"]
+    e.store.add_object_relation(subject_id=s1, predicate="carried",
+                                object_id=m, provenance="test")
+    e.store.add_object_relation(subject_id=s2, predicate="carried",
+                                object_id=m, provenance="test")
+    out = e.recall_object("message", "queue:Q9")
+    assert out["found"] is True
+    assert len(out["episodes"]) == 3
+    walls = [x["wall"] for x in out["episodes"]]
+    assert walls == sorted(walls)
+    assert sorted(out["carried_by"]) == ["s:1", "s:2"]
+    assert all("message:queue:Q9" in x["object_refs"] for x in out["episodes"])
+
+
+def test_recall_object_window_bounds_are_honored():
+    e = _engine()
+    for day, txt in ((1, "zebra alpha embarkation"), (2, "quarry beta manifest"),
+                      (3, "fjord gamma departure")):
+        from datetime import datetime, timezone
+
+        from memeng.models import Event
+        r = e.new_event(Event(
+            stream="d:s", kind="message",
+            wall=datetime(2026, 1, day, tzinfo=timezone.utc),
+            objects=[("session", "s:W")],
+            features={"subject_norm": txt, "body_text": txt, "arousal": 0.0}))
+        assert r.verdict.encoded, txt
+    out = e.recall_object("session", "s:W", since="2026-01-02T00:00:00+00:00",
+                          until="2026-01-02T23:59:59+00:00")
+    assert [x["subject"] for x in out["episodes"]] == ["quarry beta manifest"]
+
+
+def test_recall_object_unknown_identity_is_empty_not_error():
+    e = _engine()
+    out = e.recall_object("message", "queue:DOESNOTEXIST")
+    assert out == {"kind": "message", "canonical": "queue:DOESNOTEXIST",
+                   "found": False, "episodes": [], "carried_by": [],
+                   "carried": []}
+
+
+def test_episodes_in_range_reads_a_window_as_narrative():
+    e = _engine()
+    for day, txt in ((1, "harbor opens at sunrise"), (2, "cargo sways midday"),
+                      (3, "gates close after dusk")):
+        from datetime import datetime, timezone
+
+        from memeng.models import Event
+        r = e.new_event(Event(
+            stream="d:s", kind="message",
+            wall=datetime(2026, 1, day, tzinfo=timezone.utc),
+            features={"subject_norm": txt, "body_text": txt, "arousal": 0.0}))
+        assert r.verdict.encoded, txt
+    ids = e.store.episodes_in_range(stream="d:s", since="2026-01-01T00:00:00+00:00",
+                                    until="2026-01-02T12:00:00+00:00")
+    assert len(ids) == 2
+    walls = [e.store.get_episode(i).wall.isoformat() for i in ids]
+    assert walls == sorted(walls)
