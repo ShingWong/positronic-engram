@@ -1604,3 +1604,41 @@ def test_store_migrates_a_pre_last_event_wall_database(tmp_path):
     ).fetchone()[0] is not None, (
         "the column exists but is never populated, so the idle-accrual "
         "clock has nothing to read")
+
+
+# Wall-axis volume independence: the same wall-aged episodes get the same
+# wall-axis verdicts regardless of how much tau the brain holds. This is the
+# property that makes wall pruning usable for log brains, where a week's
+# ingest accrues 136k tau but 7 days -- a tau-axis prune sees ancient
+# history where a wall-axis prune sees last week. Verified to fail if the
+# wall branch reads ep.tau instead of wall age (both brains would then
+# diverge with their tau volumes).
+def test_prune_wall_axis_ignores_tau_volume():
+    from memeng.models import EpisodeRecord, Provenance
+    brains = []
+    for tau_volume in (5.0, 50000.0):
+        e, s = mk_engine()
+        # (age_days, strength, stamped profile): the 200d episode carries
+        # long_term so its thresholds (0.20/0.02) match its strength --
+        # strength without its profile's thresholds is a mismatched pair,
+        # and the per-episode stamp is what ingest writes in production.
+        for age_days, strength, prof in (
+                (60, 30.0, None), (2, 30.0, None), (200, 140.0, "long_term")):
+            feats = {"retention_profile": prof} if prof else {}
+            s.insert_episode(EpisodeRecord(
+                id=uuid.uuid4(), stream="mail:h", kind="message",
+                wall=T0 - timedelta(days=age_days), mono=1, tau=tau_volume,
+                persons=[f"p_{age_days}"], subject_norm=None, salience=0.5,
+                tier=Tier.NORMAL, strength=strength,
+                provenance=Provenance.WITNESSED,
+                fuzz_lo=None, fuzz_hi=None, precision_src="exact",
+                is_anchor=False, features=feats), 1)
+        brains.append((e, s))
+    wall_now = T0.timestamp()
+    reps = [e.prune(decay_axis="wall", wall_now=wall_now) for e, _ in brains]
+    assert (reps[0].expired, reps[0].day_merged) == \
+        (reps[1].expired, reps[1].day_merged) == (0, 1), \
+        "60d@S30 merges and 2d/200d@S140 survive on both tau volumes"
+    for _, s in brains:
+        survivors = {r.persons[0] for r in s.iter_episodes(level="event")}
+        assert survivors == {"p_2", "p_200"}, survivors

@@ -351,6 +351,14 @@ class MemoryEngine:
         #     τ, NOT wall-clock — a busy session can burn 13k τ/day. Size
         #     horizons for the workload, or the entity layer will flush in a
         #     day (the exact failure long_horizon work hits).
+        #   - On decay_axis="wall" the SAME S_* numbers read as DAYS (age is
+        #     wall-clock age in days), with no re-denomination: balanced 30,
+        #     long_term 120, short_term 6 are day-scale horizons. That is what
+        #     makes wall-axis pruning volume-independent — a week's mail log
+        #     accrues 136k τ but only 7 days, so the verdicts do not move
+        #     with ingest volume. Obj horizons read as days likewise (note
+        #     balanced obj_forget 1200 = 1200 days: effectively archival for
+        #     log entities, which is the intent — sessions outlive lines).
         #   - Long-horizon projects: prefer obj_forget large + renew_ratio
         #     > 0 over wall-clock decay, which penalizes age, not importance.
         self.retention_profiles = {
@@ -1612,7 +1620,9 @@ class MemoryEngine:
             # tau_now=2000 with episodes at tau 136k. retain=1.0 keeps them,
             # which is the only honest answer: the future cannot have decayed.
             if wall_axis:
-                # now = wall age in seconds; strength S is in wall seconds
+                # now = wall age in DAYS (see the wall branch above); strength
+                # S reads in the same day units, so the profile's S_base is a
+                # day-scale horizon on this axis with no re-denomination.
                 age = max(0.0, now)
             else:
                 age = max(0.0, now - ep.tau)
