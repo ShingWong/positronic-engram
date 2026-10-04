@@ -1443,6 +1443,8 @@ class MemoryEngine:
                 "subject": ep.subject_norm or text[:60],
                 "snippet": text[:200],
                 "class": feats.get("event_class"),
+                "role": feats.get("episode_role", "member"),
+                "member_of": feats.get("member_of"),
                 "object_refs": feats.get("object_refs") or [],
             })
         links = self.store.carried_counterparts(str(obj["id"]))

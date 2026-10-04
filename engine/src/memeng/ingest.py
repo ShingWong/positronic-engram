@@ -60,11 +60,14 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from .grouping import DELIVERY, SESSION, assign
 from .models import Event
 
 SESSION_KIND = "session"
 MESSAGE_KIND = "message"
 CARRIED = "carried"          # session --carried--> message
+GROUP_TEXT_LINES = 100       # member lines quoted in a group episode
+GROUP_TEXT_BYTES = 20_000
 
 
 @dataclass
@@ -76,6 +79,9 @@ class IngestReport:
     messages: int = 0            # distinct message objects
     relations: int = 0           # session--carried-->message edges
     sightings: int = 0
+    groups: int = 0              # group episodes (sessions + deliveries)
+    grouped_members: int = 0     # member episodes carrying member_of
+    singletons: int = 0          # groups of one: honest, not failures
     arousal_source: str = "unset"
     notes: list[str] = field(default_factory=list)
 
@@ -88,6 +94,9 @@ class IngestReport:
             "messages": self.messages,
             "relations": self.relations,
             "sightings": self.sightings,
+            "groups": self.groups,
+            "grouped_members": self.grouped_members,
+            "singletons": self.singletons,
             "arousal_source": self.arousal_source,
             "notes": list(self.notes),
         }
@@ -132,10 +141,77 @@ def _message_ids(schema: dict, record: dict,
     return seen
 
 
+def _group_text(texts: list[str]) -> tuple[str, bool]:
+    """Member lines joined for the group episode, capped.
+
+    Returns (text, truncated). The cap bounds group-episode size: a 7,260-line
+    daemon group must not become a 700KB episode. Retrieval reads the members
+    for detail; the group carries the shape of the session, not its bytes.
+    """
+    kept: list[str] = []
+    size = 0
+    for t in texts:
+        if len(kept) >= GROUP_TEXT_LINES or size >= GROUP_TEXT_BYTES:
+            break
+        kept.append(t)
+        size += len(t) + 1
+    truncated = len(kept) < len(texts)
+    if truncated:
+        kept.append(f"... +{len(texts) - len(kept)} more lines; "
+                    f"see member episodes")
+    return "\n".join(kept), truncated
+
+
+def _content_field(schema: dict) -> str | None:
+    for layer in ("envelope", "payload"):
+        for e in (schema.get("record_layers") or {}).get(layer, []) or []:
+            if isinstance(e, dict) and e.get("role") == "content":
+                return e.get("path")
+    return None
+
+
+def _group_event(stream: str, g, *, recs: list[dict],
+                 classes: list, arousals: list[float],
+                 content_field: str | None) -> Event:
+    """One episode for the whole group: session or delivery.
+
+    The wall is the first member's wall, so the group leads its members in
+    tau order. The arousal is the members' mean -- a session containing one
+    rare line scores high, which is how the 49 bounces in 1.5M lines stay
+    visible at session granularity instead of dissolving into routine means.
+    """
+    texts = [str(r.get(content_field) or "") for r in recs] \
+        if content_field else [str(r) for r in recs]
+    body, truncated = _group_text([t for t in texts if t])
+    hist: dict[str, int] = {}
+    for c in classes:
+        if c is not None:
+            hist[c] = hist.get(c, 0) + 1
+    kind = SESSION if g.kind == SESSION else DELIVERY
+    canon = g.canonical
+    objs = [(SESSION_KIND if g.kind == SESSION else MESSAGE_KIND, canon)]
+    feats = {
+        "episode_role": "group",
+        "group_canonical": canon,
+        "group_kind": g.kind,
+        "member_count": len(g.members),
+        "span_seconds": round(g.span_seconds, 1),
+        "class_histogram": hist,
+        "truncated": truncated,
+        "subject_norm": f"{g.kind} {canon}: {len(g.members)} records",
+        "body_text": body,
+        "arousal": (sum(arousals) / len(arousals)) if arousals else 0.0,
+    }
+    return Event(stream=stream, kind=kind, wall=g.first_wall,
+                 features=feats, objects=objs)
+
+
 def ingest_records(engine, schema: dict, records: Iterable[dict], *,
                    stream: str, limit: int | None = None,
                    classify: Callable[[dict], str | None] | None = None,
-                   commit_every: int = 1000) -> IngestReport:
+                   commit_every: int = 1000,
+                   group: bool = True,
+                   gap_seconds: int = 3600) -> IngestReport:
     """Ingest log records under a validated schema. Returns what happened.
 
     `stream` must already be attached (the caller owns domain setup, the way
@@ -198,9 +274,13 @@ def ingest_records(engine, schema: dict, records: Iterable[dict], *,
                          "so per-event retention has no signal in this run")
     top = max(freq.values()) if freq else 1
 
-    events: list[Event] = []
-    meta: list[tuple[str | None, list[str], datetime]] = []
-    for r, c in zip(batch, classes):
+    # Per-record pass: wall, identity, message ids, arousal, class.
+    walls: list = []
+    canonicals: list = []
+    id_lists: list = []
+    arousals: list = []
+    kept: list[int] = []          # batch indices that survived the clock
+    for bi, (r, c) in enumerate(zip(batch, classes)):
         rep.records_seen += 1
         wall = _wall(r, time_field)
         if wall is None:
@@ -210,16 +290,74 @@ def ingest_records(engine, schema: dict, records: Iterable[dict], *,
             if key_fields else None
         ids = _message_ids(schema, r, rx)
         arousal = (1.0 - freq[c] / top) if c is not None else 1.0
+        walls.append(wall)
+        canonicals.append(canonical)
+        id_lists.append(ids)
+        arousals.append(arousal)
+        kept.append(bi)
+
+    content_field = _content_field(schema)
+
+    # Grouping pass: sessions and deliveries over the surviving records.
+    groups = []
+    group_of: dict[int, object] = {}
+    if group:
+        recs = [batch[bi] for bi in kept]
+        groups = []
+        idx_of = {id(r): n for n, r in enumerate(recs)}
+        groups = assign(
+            recs,
+            session_of=lambda r: canonicals[idx_of[id(r)]],
+            messages_of=lambda r: id_lists[idx_of[id(r)]],
+            wall_of=lambda r: walls[idx_of[id(r)]],
+            gap_seconds=gap_seconds)
+        for g in groups:
+            for pos in g.members:
+                group_of[kept[pos]] = g
+        rep.groups = sum(1 for g in groups if len(g.members) > 1)
+        rep.singletons = sum(1 for g in groups if len(g.members) == 1)
+
+    events: list[Event] = []
+    # meta aligns with events: (canonical, ids, wall, kind, group, is_group)
+    meta: list = []
+    emitted_group: set[int] = set()
+    for n, bi in enumerate(kept):
+        r = batch[bi]
+        g = group_of.get(bi)
         feats = dict(r)
-        feats["identity_canonical"] = canonical
-        feats["message_ids"] = ids
-        feats["event_class"] = c
-        feats["arousal"] = arousal
-        objs = (([(SESSION_KIND, canonical)] if canonical else [])
-                + [(MESSAGE_KIND, f"queue:{m}") for m in ids])
-        events.append(Event(stream=stream, kind="message", wall=wall,
+        feats["identity_canonical"] = canonicals[n]
+        feats["message_ids"] = id_lists[n]
+        feats["event_class"] = classes[bi]
+        feats["arousal"] = arousals[n]
+        objs = (([(SESSION_KIND, canonicals[n])] if canonicals[n] else [])
+                + [(MESSAGE_KIND, f"queue:{m}") for m in id_lists[n]])
+        if g is not None:
+            feats["member_of"] = g.canonical
+            feats["group_rank"] = g.members.index(n)
+            rep.grouped_members += 1
+            if id(g) not in emitted_group:
+                # The group episode leads its members: same file position as
+                # the first member, so tau order tells the story in order.
+                # Singletons emit nothing: a group of one duplicates its
+                # member exactly, and the gate rejects the copy on novelty --
+                # correctly, which is why this is a rule rather than a hope.
+                # The member still carries member_of, naming the group that
+                # logically contains it. Note the member event below is
+                # appended unconditionally: skipping the GROUP is not
+                # skipping the MEMBER.
+                emitted_group.add(id(g))
+                if len(g.members) > 1:
+                    events.append(_group_event(
+                        stream, g,
+                        recs=[batch[kept[p]] for p in g.members],
+                        classes=[classes[kept[p]] for p in g.members],
+                        arousals=[arousals[p] for p in g.members],
+                        content_field=content_field))
+                    meta.append((None, [], walls[n], "group", g, True))
+        events.append(Event(stream=stream, kind="message", wall=walls[n],
                             features=feats, objects=objs))
-        meta.append((canonical, ids, wall))
+        meta.append((canonicals[n], id_lists[n], walls[n], "message",
+                     g, False))
 
     results = engine.new_events(events, commit_every=commit_every)
 
@@ -231,7 +369,13 @@ def ingest_records(engine, schema: dict, records: Iterable[dict], *,
     # adds nothing.
     session_ids: dict[str, str] = {}
     message_ids: dict[str, str] = {}
-    for (canonical, ids, wall), res in zip(meta, results):
+    # Groups need their kinds registered the same way objects did: the
+    # registry should name what exists rather than discover it later.
+    for kind in (SESSION, DELIVERY):
+        store.conn.execute("INSERT OR IGNORE INTO lu_kind(name) VALUES (?)",
+                           (kind,))
+    store._commit()
+    for (canonical, ids, wall, _kind, _g, _is_group), res in zip(meta, results):
         if res.episode_id is None:
             continue
         rep.ingested += 1

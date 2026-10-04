@@ -59,10 +59,13 @@ def _did(e):
 def test_identity_objects_converge_across_records():
     e = _engine()
     rep = ingest_records(e, SCHEMA, RECS, stream="d:s")
-    assert rep.ingested == 3
+    assert rep.ingested == 4          # 3 members + 1 group episode
+    assert rep.groups == 1            # the qmgr singleton emits no duplicate
     assert rep.skipped_no_clock == 1
     assert rep.sessions == 2          # two (ident, pid) pairs, not 3 lines
     assert rep.messages == 1          # one queue id across two records
+    # Only the 2-member smtpd session emits a group episode; the qmgr
+    # singleton would duplicate its member and is skipped by rule.
     rows = e.store.conn.execute(
         "SELECT canonical_name FROM object WHERE kind=?",
         (SESSION_KIND,)).fetchall()
@@ -88,15 +91,26 @@ def test_session_carried_message_relation_is_written():
 
 def test_every_field_reaches_features_not_one_string():
     e = _engine()
-    ingest_records(e, SCHEMA, RECS[:1], stream="d:s")
-    feats = e.store.conn.execute("SELECT features_json FROM episode").fetchone()[0]
+    rep = ingest_records(e, SCHEMA, RECS[:1], stream="d:s")
+    assert rep.groups == 0 and rep.singletons == 1
     import json
-    f = json.loads(feats)
-    assert f["ident"] == "postfix/smtpd"
-    assert f["pid"] == "11"
-    assert f["message"] == "connect from x"
-    assert f["identity_canonical"] == "postfix/smtpd:11"
-    assert f["message_ids"] == []
+    rows = e.store.conn.execute(
+        "SELECT features_json FROM episode").fetchall()
+    by_role = {}
+    for (fj,) in rows:
+        f = json.loads(fj)
+        by_role[f.get("episode_role", "member")] = f
+    m = by_role["member"]
+    assert m["ident"] == "postfix/smtpd"
+    assert m["pid"] == "11"
+    assert m["message"] == "connect from x"
+    assert m["identity_canonical"] == "postfix/smtpd:11"
+    assert m["message_ids"] == []
+    assert m["member_of"] == "postfix/smtpd:11"
+    # A lone record is a session singleton: no group episode is emitted (it
+    # would duplicate the member), but member_of still names the group that
+    # logically contains it.
+    assert "group" not in by_role
 
 
 def test_arousal_is_inverse_frequency_not_zero():
@@ -109,9 +123,18 @@ def test_arousal_is_inverse_frequency_not_zero():
     import json
     rows = e.store.conn.execute(
         "SELECT features_json FROM episode ORDER BY wall").fetchall()
-    a = [json.loads(r[0])["arousal"] for r in rows]
+    feats = [json.loads(r[0]) for r in rows]
+    members = [f["arousal"] for f in feats
+               if f.get("episode_role") != "group"]
+    groups = [f["arousal"] for f in feats
+              if f.get("episode_role") == "group"]
     # queue class has 2 members, connect has 1: the common class scores lower.
-    assert a[0] == 1.0 - 1 / 2 and a[1] == 0.0 and a[2] == 0.0
+    assert members == [1.0 - 1 / 2, 0.0, 0.0]
+    # One delivery group (both queue lines name the same id; the rule puts a
+    # record with a message id in the delivery, not the session). Mean of two
+    # queue members: 0.0. The connect line stands alone in a session
+    # singleton, which emits no duplicate episode by rule.
+    assert groups == [0.0]
 
 
 def test_without_classifier_the_report_says_so():
@@ -328,3 +351,63 @@ def test_episodes_in_range_reads_a_window_as_narrative():
     assert len(ids) == 2
     walls = [e.store.get_episode(i).wall.isoformat() for i in ids]
     assert walls == sorted(walls)
+
+
+# ------------------------------------------------- grouping
+
+def _recs():
+    from datetime import datetime, timezone
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    from datetime import timedelta
+    return [
+        {"s": "a:1", "m": [], "w": base},                                          # 0 session a:1
+        {"s": "a:1", "m": [], "w": base + timedelta(seconds=60)},                  # 1 same session
+        {"s": "a:1", "m": [], "w": base + timedelta(seconds=7200)},                # 2 gap split
+        {"s": "b:2", "m": ["Q1"], "w": base},                                      # 3 delivery Q1
+        {"s": "c:3", "m": ["Q1"], "w": base + timedelta(seconds=5)},                # 4 same delivery, other session
+        {"s": "c:3", "m": ["Q1", "Q2"], "w": base + timedelta(seconds=9)},         # 5 two ids -> first wins
+        {"s": None, "m": [], "w": base},                                           # 6 no identity at all
+    ]
+
+
+def test_grouping_rule():
+    from memeng.grouping import assign
+    rs = _recs()
+    gs = assign(rs, session_of=lambda r: r["s"], messages_of=lambda r: r["m"],
+                wall_of=lambda r: r["w"])
+    by_member = {}
+    for g in gs:
+        for i in g.members:
+            by_member[i] = g
+    assert by_member[0] is by_member[1]            # same session, small gap
+    assert by_member[0] is not by_member[2]        # gap split, seq continues
+    assert by_member[2].seq == 2
+    assert by_member[2].canonical == "a:1#2"
+    assert by_member[3] is by_member[4] is by_member[5]   # delivery by first id
+    assert by_member[3].kind == "delivery"
+    assert by_member[6].kind == "session" and len(by_member[6].members) == 1
+    assert sum(len(g.members) for g in gs) == len(rs)     # nothing lost
+
+
+def test_grouping_cap_splits_mega_groups():
+    from datetime import timedelta
+
+    from memeng.grouping import assign
+    base = _recs()[0]["w"]
+    rs = [{"s": "q:mgr", "m": [], "w": base + timedelta(seconds=10 * i)}
+          for i in range(30)]
+    gs = assign(rs, session_of=lambda r: r["s"], messages_of=lambda r: r["m"],
+                wall_of=lambda r: r["w"], max_lines=10)
+    assert len(gs) == 3
+    assert [g.seq for g in gs] == [1, 2, 3]
+    assert all(len(g.members) == 10 for g in gs)
+
+
+def test_grouping_is_deterministic():
+    from memeng.grouping import assign
+    rs = _recs()
+    kw = {"session_of": lambda r: r["s"], "messages_of": lambda r: r["m"],
+          "wall_of": lambda r: r["w"]}
+    a = [(g.kind, g.canonical, list(g.members)) for g in assign(rs, **kw)]
+    b = [(g.kind, g.canonical, list(g.members)) for g in assign(rs, **kw)]
+    assert a == b
