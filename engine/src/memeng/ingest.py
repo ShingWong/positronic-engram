@@ -192,7 +192,12 @@ def _group_event(stream: str, g, *, recs: list[dict],
             hist[c] = hist.get(c, 0) + 1
     kind = SESSION if g.kind == SESSION else DELIVERY
     canon = g.canonical
-    objs = [(SESSION_KIND if g.kind == SESSION else MESSAGE_KIND, canon)]
+    # The linked OBJECT is the unsuffixed identity: a split suffix (#2, #5)
+    # names the group episode, not a new entity. Linking the suffixed name
+    # minted phantom sessions -- measured as 2 extra objects in a 100k-visitor
+    # brain, each a returning visitor's later visit filed under a new name.
+    # The episode keeps the suffixed group_canonical; the object does not.
+    objs = [(SESSION_KIND if g.kind == SESSION else MESSAGE_KIND, g.key)]
     feats = {
         "episode_role": "group",
         "group_canonical": canon,

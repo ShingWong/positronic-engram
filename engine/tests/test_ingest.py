@@ -452,3 +452,34 @@ def test_object_identity_lookup_is_indexed_not_scanned():
     cols = [r[2] for r in e.store.conn.execute(
         "PRAGMA index_info(obj_lookup)").fetchall()]
     assert cols == ["domain_id", "kind", "canonical_name"]
+
+
+def test_split_groups_link_the_base_identity_not_the_suffix():
+    """A gap-split group episode must link the session object, not mint a
+    suffixed phantom. Measured: 2 extra objects in a 100k-visitor brain, each
+    a returning visitor filed under `who#N` as if a new person."""
+    e = _engine()
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # Three records: the first stands alone, the later two form the SECOND
+    # group for the same session (seq 2, canonical "s:1#2"). The group
+    # episode must link "s:1", not mint "s:1#2" as a new entity.
+    from memeng.ingest import ingest_records
+    recs = [
+        {"ident": "s", "pid": "1", "stamp": base.isoformat(),
+         "message": "morning arrival alpha"},
+        {"ident": "s", "pid": "1",
+         "stamp": (base + timedelta(seconds=7200)).isoformat(),
+         "message": "evening return beta"},
+        {"ident": "s", "pid": "1",
+         "stamp": (base + timedelta(seconds=7260)).isoformat(),
+         "message": "evening return gamma"},
+    ]
+    schema = dict(SCHEMA)
+    rep = ingest_records(e, schema, recs, stream="d:s",
+                         classify=lambda r: "c", gap_seconds=3600)
+    assert rep.groups == 1
+    names = sorted(r[0] for r in e.store.conn.execute(
+        "SELECT canonical_name FROM object WHERE kind='session'").fetchall())
+    assert names == ["s:1"], names
