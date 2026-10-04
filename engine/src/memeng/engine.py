@@ -948,7 +948,14 @@ class MemoryEngine:
                     "stream": ep.stream if ep else None,
                     "salience": ep.salience if ep else None,
                     "kind": ep.kind if ep else None,
-                    "person_boost": pboost,
+                    # Was `person_boost`. Renamed when the boost stopped
+                    # being about people: shared schema objects boost
+                    # identically, and a key named for one participant class
+                    # lies about the other. No alias kept -- a deprecated
+                    # duplicate would let two names for one number disagree
+                    # invisibly, which is the exact failure class this
+                    # codebase refuses.
+                    "participant_boost": pboost,
                     "fallback": fallback,
                     "message_id": feats.get("message_id") or "",
                     "sender": feats.get("sender") or "",

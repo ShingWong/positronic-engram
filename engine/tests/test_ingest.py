@@ -225,7 +225,7 @@ def test_fusion_boosts_shared_message():
     by_id = {str(x["episode_id"]): x for x in out}
     q1 = [str(r1.episode_id), str(r2.episode_id)]
     assert all(q in by_id for q in q1)
-    assert all(by_id[q]["person_boost"] == 1.3 for q in q1)
+    assert all(by_id[q]["participant_boost"] == 1.3 for q in q1)
     # Without the identity cue, r2 shares no text with the query and must
     # NOT surface: this is what proves the object channel did the work,
     # rather than the test passing on lexical overlap alone.
