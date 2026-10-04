@@ -886,6 +886,100 @@ class SQLiteStore:
             (episode_id, object_id, channel, confidence))
         self._commit()
 
+    def find_object(self, *, domain_id: int, kind: str,
+                      canonical_name: str | None) -> dict | None:
+        r = self.conn.execute(
+            "SELECT * FROM object WHERE domain_id=? AND kind=? AND "
+            "canonical_name IS ?", (domain_id, kind, canonical_name)).fetchone()
+        return dict(r) if r else None
+
+    def bump_object_salience(self, object_id: str, amount: float = 0.05,
+                             cap: float = 1.0) -> None:
+        """Credit an object with evidence that it matters: an episode encoded
+        through it. Additive and capped, the same shape as honor_persons, so
+        repeated encoding saturates rather than running away."""
+        if amount <= 0:
+            return
+        self.conn.execute(
+            "UPDATE object SET salience=MIN(?, salience + ?) WHERE id=?",
+            (cap, amount, object_id))
+        self._commit()
+
+    def object_ids_for_refs(self, *, domain_id: int,
+                            refs) -> list[str]:
+        """Resolve stored `kind:canonical` refs to object ids in one query.
+
+        Retrieval-time lookup for honor/fusion paths. One round trip, not one
+        per episode -- the prune work showed what per-episode queries cost.
+        """
+        refs = list(refs or ())
+        if not refs:
+            return []
+        kinds, canons = [], []
+        for r in refs:
+            k, _, c = r.partition(":")
+            kinds.append(k)
+            canons.append(c)
+        rows = self.conn.execute(
+            "SELECT id, kind, canonical_name FROM object "
+            "WHERE domain_id=? AND kind IN ({k}) AND canonical_name IN ({c})"
+            .format(k=",".join("?" * len(kinds)),
+                    c=",".join("?" * len(canons))),
+            (domain_id, *kinds, *canons)).fetchall()
+        want = set(refs)
+        return [str(r["id"]) for r in rows
+                if f"{r['kind']}:{r['canonical_name']}" in want]
+
+    def episodes_for_objects(self, *, domain_id: int, refs,
+                                 limit: int = 100) -> list[str]:
+        """Episode ids seen through the named objects, newest first.
+
+        The object-identity retrieval channel: a cue naming a message gets
+        every episode of that message's life, with zero text overlap required.
+        This is the query the whole message axis exists to answer.
+        """
+        oids = self.object_ids_for_refs(domain_id=domain_id, refs=refs)
+        if not oids:
+            return []
+        rows = self.conn.execute(
+            "SELECT DISTINCT g.episode_id FROM object_sighting g "
+            "JOIN episode e ON e.id = g.episode_id "
+            "WHERE g.object_id IN ({o}) ORDER BY e.wall DESC LIMIT ?"
+            .format(o=",".join("?" * len(oids))),
+            (*oids, limit)).fetchall()
+        return [str(r[0]) for r in rows]
+
+    def all_object_domains(self) -> list[int]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT domain_id FROM object").fetchall()
+        return [int(r[0]) for r in rows]
+
+    def honor_objects(self, object_ids, *, weight: float = 0.01) -> None:
+        """Retrieval credit for objects, mirroring honor_persons."""
+        bump = float(weight)
+        if bump <= 0:
+            return
+        for oid in object_ids or ():
+            self.conn.execute(
+                "UPDATE object SET salience=MIN(1.0, salience + ?) "
+                "WHERE id=?", (bump, oid))
+        self._commit()
+
+    def decay_object_salience(self, *, rate: float = 0.01) -> int:
+        """Regression toward the 0.5 prior, mirroring decay_person_weights.
+
+        Runs on the prune pass. A credit that never faded would make every
+        once-busy session permanently important, which is the same failure
+        the person decay exists to prevent.
+        """
+        cur = self.conn.execute(
+            "UPDATE object SET salience = 0.5 + (salience - 0.5) * ? "
+            "WHERE salience <> 0.5", (max(0.0, min(1.0, 1.0 - rate)),))
+        moved = cur.rowcount or 0
+        if moved:
+            self._commit()
+        return moved
+
     def touch_object(self, object_id: str, tau: float,
                      wall: datetime) -> None:
         self.conn.execute(

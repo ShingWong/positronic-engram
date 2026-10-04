@@ -63,6 +63,14 @@ class Event:
     kind: str                      # lookup key; validated against lu_kind
     wall: datetime | None = None   # None => store clock
     persons: list[str] = field(default_factory=list)
+    # Schema identities, NOT people: [(kind, canonical_name), ...], e.g.
+    # ("session", "postfix/smtpd:17810"), ("message", "queue:2C79E142DE806").
+    # persons[] keeps meaning human actors; objects[] carries everything else
+    # the schema identifies. Both are participants for gain, dedup and
+    # retrieval purposes -- see new_event and activate -- but only persons[]
+    # feeds sender stats and actor gain in reinforce, because a log session
+    # is not a correspondent.
+    objects: list[tuple[str, str]] = field(default_factory=list)
     features: dict[str, Any] = field(default_factory=dict)
     fuzz_width: timedelta | None = None
 

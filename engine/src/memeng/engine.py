@@ -502,9 +502,19 @@ class MemoryEngine:
             else:
                 novelty = 0.6          # unreachable: see test_gate_no_partial_credit
 
-            gains = [float((self.store.get_person(p) or
+            # Participant gain: people AND schema identities. A session the
+            # schema identifies is the same kind of evidence as a person the
+            # text names -- something this episode is ABOUT -- so the gate
+            # listens to both. Object salience starts at the same 0.5 prior
+            # as person weight, and earns its movement the same way: bumps
+            # on encode-through, credit on retrieval, decay on prune.
+            gains = [float((self.store.get_person(x) or
                             {"weight": 0.5})["weight"])
-                     for p in event.persons]
+                     for x in event.persons]
+            gains += [float((self.store.find_object(
+                domain_id=domain_id, kind=k, canonical_name=c) or
+                {"salience": 0.5})["salience"])
+                for k, c in (event.objects or [])]
             gain = max(gains, default=0.5)
 
             arousal = float(event.features.get("arousal", 0.0))
@@ -605,8 +615,34 @@ class MemoryEngine:
                     provenance=Provenance.WITNESSED, fuzz_lo=fuzz_lo,
                     fuzz_hi=fuzz_hi, precision_src=precision,
                     is_anchor=is_anchor, features=dict(event.features))
+                # Schema identities resolve BEFORE the record is built, so
+                # the stored features carry the participant list and no
+                # second write is needed. Linking (which needs the episode
+                # id) follows the insert. One writer, inside new_event, so
+                # the gate's gain above and this write cannot disagree about
+                # what an episode is about.
+                resolved: list[tuple[str, str, str]] = []
+                if event.objects:
+                    for kind, canon in event.objects:
+                        oid = self.store.get_or_create_object(
+                            domain_id=domain_id, kind=kind,
+                            canonical_name=canon, wall=event.wall,
+                            tau=new_tau)
+                        resolved.append((oid, kind, canon))
+                    # Written to BOTH: event.features for the caller's view,
+                    # rec.features for the stored one -- rec was built with a
+                    # copy at construction, so mutating the event alone would
+                    # store a record without its own participant list.
+                    refs = [f"{k}:{c}" for _, k, c in resolved]
+                    event.features.setdefault("object_refs", refs)
+                    rec.features.setdefault("object_refs", refs)
                 self.store.insert_episode(rec, domain_id)
                 episode_id = rec.id
+                for oid, _k, _c in resolved:
+                    self.store.link_sighting(
+                        str(rec.id), oid, channel="schema")
+                    self.store.touch_object(oid, new_tau, event.wall)
+                    self.store.bump_object_salience(oid)
                 self._remember_terms(event)   # feed the novelty window
                 verdict.encoded = True
                 self.tel.incr("encoded")
@@ -728,7 +764,10 @@ class MemoryEngine:
                  context_window: int = 0) -> list[dict]:
         """Fused fuzzy recall. Cue channels (all optional):
           text:      -> lexical FTS5 + semantic embedding (when bound)
-          persons:   -> person boost on fusion
+          persons:   -> participant boost on fusion (people)
+          objects:   -> object-identity channel (episodes seen through the
+                      named objects, e.g. "message:queue:Q1") PLUS the
+                      participant boost for anything else the cue matches
           stream:    -> restrict candidates
           tau_now:   -> unused (kept for caller compat)
         Relevance channels are RRF-fused; the recency channel is a FALLBACK
@@ -793,6 +832,36 @@ class MemoryEngine:
                     channels.append(or_ids)
                     weights.append(1.0)
 
+            cue_objs_early = list(cue.get("objects") or [])
+            if cue_objs_early:
+                # The identity channel. A cue naming a message gets every
+                # episode of that message's life with no text overlap
+                # required -- the boost below can only re-rank candidates
+                # a channel returns, so identity needs its own channel.
+                # Scoped to the cue's domain when the caller names one via
+                # stream; otherwise searched across all domains, because an
+                # identity is global in a way text is not.
+                did = None
+                if cue.get("stream"):
+                    srow = self.store.get_stream(cue["stream"]) or {}
+                    did = srow.get("domain_id")
+                obj_ids: list[str] = []
+                if did is not None:
+                    obj_ids = self.store.episodes_for_objects(
+                        domain_id=int(did), refs=cue_objs_early, limit=k * 3)
+                else:
+                    seen_e: set[str] = set()
+                    for dd in self.store.all_object_domains():
+                        for eid in self.store.episodes_for_objects(
+                                domain_id=int(dd), refs=cue_objs_early,
+                                limit=k * 3):
+                            if eid not in seen_e:
+                                seen_e.add(eid)
+                                obj_ids.append(eid)
+                if obj_ids:
+                    channels.append(obj_ids)
+                    weights.append(1.4)
+
             if not channels:
                 fallback = True
                 rec_ids = self.store.recent_candidates(k * 3,
@@ -831,16 +900,34 @@ class MemoryEngine:
             # weight from a nonsense query. The fallback is still the right
             # answer for a caller browsing by recency; it is not evidence that
             # anything was recalled on request.
+            cue_objs = set(cue.get("objects") or [])
             for rank, eid in enumerate(fused[:self._honor_window], 1):
                 ep = eps_by_id.get(eid)
                 if ep and not consolidation and not fallback:
                     self.store.honor_persons(
                         ep.persons or [],
                         weight=float(self.base_cfg["honor_credit"]) / rank)
+                    ep_did = (self.store.get_stream(ep.stream) or {})\
+                        .get("domain_id")
+                    if ep_did is not None:
+                        self.store.honor_objects(
+                            self.store.object_ids_for_refs(
+                                domain_id=int(ep_did),
+                                refs=(ep.features or {})
+                                .get("object_refs")),
+                            weight=float(
+                                self.base_cfg["honor_credit"]) / rank)
             out = []
             for rank, eid in enumerate(fused, 1):
                 ep = eps_by_id.get(eid)
-                pboost = (1.3 if ep and persons & set(ep.persons or [])
+                ep_objs = set((ep.features or {}).get("object_refs") or ()) \
+                    if ep else set()
+                # "Same message, later in its life" is the strongest relevance
+                # signal a log corpus has: a queue id shared between cue and
+                # episode means the SAME message, where a shared word means
+                # merely similar wording.
+                pboost = (1.3 if ep and (persons & set(ep.persons or [])
+                                         or cue_objs & ep_objs)
                           else 1.0)
                 base = sum(w / (60 + i + 1)
                            for ch, w in zip(channels, weights)
@@ -1165,6 +1252,7 @@ class MemoryEngine:
         seen: set[tuple] = set()
         recent: deque[tuple] = deque(maxlen=window)
         window_actors: set[tuple] = set()
+        window_objs: set[tuple] = set()
         thresh_cache: dict = {}
         merged = 0
         for ep in self.store.iter_episodes(ordered=True):
@@ -1209,12 +1297,19 @@ class MemoryEngine:
             # they are separate events that happen to share wording, and
             # keeping them is right: a few more duplicates is the cheap
             # mistake, a dropped fact is not.
-            key = (terms, tuple(sorted(ep.persons or ())))
+            # The object component is read from stored features, not from
+            # a per-episode sightings lookup -- the scan already costs 1.5M
+            # generator calls at 11,840 episodes, and a query per episode
+            # would multiply it. Same text on different sessions is a
+            # different occurrence, full stop.
+            objs = tuple(sorted(
+                (ep.features or {}).get("object_refs") or ()))
+            key = (terms, tuple(sorted(ep.persons or ())), objs)
             wall = ep.wall.timestamp()
             # O(1) actor membership, maintained with the deque. The scan
             # cost 1.5M generator calls at 11,840 episodes -- O(window) per
             # episode to answer a set lookup.
-            same_actor = key[1] in window_actors
+            same_actor = key[1] in window_actors and key[2] in window_objs
             close = recent and (wall - recent[-1][2]) <= span
             if key in seen and not (same_actor and close):
                 dup = False                      # a distinct occurrence
@@ -1236,7 +1331,7 @@ class MemoryEngine:
                 qn_ = len(key[0])
                 dup = False
                 for r_ in recent:
-                    if r_[1] != key[1]:
+                    if r_[1] != key[1] or r_[3] != key[2]:
                         continue
                     m_ = len(r_[0])
                     if not (m_ * lo_t <= qn_ <= m_ / lo_t):
@@ -1258,8 +1353,10 @@ class MemoryEngine:
             seen.add(key)
             if len(recent) == window:          # deque evicts the head next
                 window_actors.discard(recent[0][1])
-            recent.append((terms, key[1], wall))
+                window_objs.discard(recent[0][3])
+            recent.append((terms, key[1], wall, key[2]))
             window_actors.add(key[1])
+            window_objs.add(key[2])
         return merged
 
     @staticmethod
@@ -1321,6 +1418,8 @@ class MemoryEngine:
         # own timer. Read-only with respect to episodes, so it cannot make a
         # prune non-idempotent.
         self.store.decay_person_weights(
+            rate=float(self.base_cfg.get("gain_decay_rate", 0.01)))
+        self.store.decay_object_salience(
             rate=float(self.base_cfg.get("gain_decay_rate", 0.01)))
         # ONE transaction for the whole pass. Measured at 11,840 episodes:
         # 46,252 SQL executes and ~8s of prune's 26s, because every demotion

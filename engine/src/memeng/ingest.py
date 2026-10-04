@@ -32,6 +32,13 @@ points the right way) and a stream of record dicts, and:
   the first `object_relation` writer the store has ever had: the session that
   carried each message. `object_relation` and `anchor_edge` both shipped with
   zero writers; ingestion is the natural first writer for relations.
+
+Object resolution and sighting linkage live in `MemoryEngine.new_event`, not
+here: the gate reads object salience for participant gain, so resolving after
+the gate would let the gate and the write disagree about what an episode is
+about. This module passes `objects=[(kind, canonical), ...]` on each Event and
+writes relations afterwards (re-resolving converges on the same ids).
+`persons[]` is left empty on purpose -- see the module note above.
 * `arousal` from inverse class frequency, when a classifier is supplied. The
   engine reads `arousal` but nobody computes it, so the per-event retention
   lever has been inert in every measurement. Rare classes score near 1.0,
@@ -208,15 +215,20 @@ def ingest_records(engine, schema: dict, records: Iterable[dict], *,
         feats["message_ids"] = ids
         feats["event_class"] = c
         feats["arousal"] = arousal
+        objs = (([(SESSION_KIND, canonical)] if canonical else [])
+                + [(MESSAGE_KIND, f"queue:{m}") for m in ids])
         events.append(Event(stream=stream, kind="message", wall=wall,
-                            features=feats))
+                            features=feats, objects=objs))
         meta.append((canonical, ids, wall))
 
     results = engine.new_events(events, commit_every=commit_every)
 
-    # The linking pass. Objects dedupe on (kind, canonical_name), so re-running
-    # a batch converges rather than duplicating -- `get_or_create_object`
-    # returns the existing id on a rematch.
+    # The relations pass. Sightings were already linked inside new_event;
+    # this writes only the session--carried-->message edges, which need both
+    # ends and therefore cannot be written until both objects exist.
+    # Re-resolving converges on the same ids new_event created.
+    # INSERT OR IGNORE makes the whole pass idempotent: re-running a batch
+    # adds nothing.
     session_ids: dict[str, str] = {}
     message_ids: dict[str, str] = {}
     for (canonical, ids, wall), res in zip(meta, results):
@@ -232,8 +244,6 @@ def ingest_records(engine, schema: dict, records: Iterable[dict], *,
                     domain_id=domain_id, kind=SESSION_KIND,
                     canonical_name=canonical, wall=wall, tau=tau)
                 session_ids[canonical] = oid
-            store.link_sighting(ep, oid, channel="schema-identity")
-            store.touch_object(oid, tau, wall)
             rep.sightings += 1
         for mid in ids:
             qname = f"queue:{mid}"
@@ -243,8 +253,6 @@ def ingest_records(engine, schema: dict, records: Iterable[dict], *,
                     domain_id=domain_id, kind=MESSAGE_KIND,
                     canonical_name=qname, wall=wall, tau=tau)
                 message_ids[qname] = moid
-            store.link_sighting(ep, moid, channel="schema-message")
-            store.touch_object(moid, tau, wall)
             rep.sightings += 1
             if canonical:
                 rel = store.add_object_relation(

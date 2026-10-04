@@ -52,6 +52,10 @@ def _engine():
     return e
 
 
+def _did(e):
+    return int(e.store.get_stream("d:s")["domain_id"])
+
+
 def test_identity_objects_converge_across_records():
     e = _engine()
     rep = ingest_records(e, SCHEMA, RECS, stream="d:s")
@@ -137,3 +141,107 @@ def test_bad_pattern_is_an_error_not_zero_ids():
         assert "exactly one" in str(ex)
     else:
         raise AssertionError("two-group pattern accepted silently")
+
+
+# ------------------------------------------------- participants
+
+def _ev(stream="d:s", persons=None, objects=None, text="hello world"):
+    from datetime import datetime, timezone
+
+    from memeng.models import Event
+    return Event(stream=stream, kind="message",
+                 wall=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                 persons=persons or [], objects=objects or [],
+                 features={"subject_norm": text, "body_text": text,
+                           "arousal": 0.0})
+
+
+def test_object_salience_feeds_gate_gain():
+    e = _engine()
+    # A salient session pulls a mediocre episode over the line; without the
+    # object the same text and no people scores gain 0.5.
+    oid = e.store.get_or_create_object(
+        domain_id=_did(e), kind="session", canonical_name="s:1",
+        wall=_ev().wall, tau=0.0)
+    e.store.conn.execute("UPDATE object SET salience=1.0 WHERE id=?", (oid,))
+    e.store._commit()
+    v_obj = e.new_event(_ev(objects=[("session", "s:1")]))
+    v_plain = e.new_event(_ev())
+    assert v_obj.verdict.score >= v_plain.verdict.score
+
+
+def test_encode_links_sightings_and_credits_salience():
+    e = _engine()
+    e.new_event(_ev(objects=[("session", "s:9")]))
+    o = e.store.find_object(domain_id=_did(e), kind="session", canonical_name="s:9")
+    assert o is not None and float(o["salience"]) > 0.5
+    links = e.store.conn.execute(
+        "SELECT * FROM object_sighting WHERE object_id=?",
+        (o["id"],)).fetchall()
+    assert len(links) == 1
+
+
+def test_dedup_separates_same_text_on_different_sessions():
+    # Stored directly to isolate prune from the gate: the gate would reject
+    # the second identical text on novelty before prune ever saw it, which
+    # is correct gate behavior and a different test.
+    import uuid
+
+    from memeng.models import Provenance
+    from memeng.store import EpisodeRecord, Tier
+    e = _engine()
+    for sess in ("s:A", "s:B"):
+        e.store.insert_episode(EpisodeRecord(
+            id=uuid.uuid4(), stream="d:s", kind="message",
+            wall=_ev().wall, mono=1, tau=1.0, persons=[],
+            subject_norm="hello world", salience=0.5, tier=Tier.NORMAL,
+            strength=1.0, provenance=Provenance.WITNESSED,
+            fuzz_lo=None, fuzz_hi=None, precision_src="exact",
+            is_anchor=False,
+            features={"subject_norm": "hello world",
+                      "body_text": "hello world",
+                      "object_refs": [f"session:{sess}"]}), _did(e))
+    # prune takes tau_now positionally; the domain goes by keyword. Passing
+    # "d" positionally once dated the whole sweep to the string "d".
+    rep = e.prune(domain="d")
+    assert rep.deduped == 0
+    n = e.store.conn.execute(
+        "SELECT COUNT(*) FROM episode WHERE level='event'").fetchone()[0]
+    assert n == 2
+
+
+def test_fusion_boosts_shared_message():
+    e = _engine()
+    # Different wording per record: identical text would be gate-rejected on
+    # novelty before fusion ever saw it, which is correct gate behavior and a
+    # different test. Same message object, different words.
+    r1 = e.new_event(_ev(objects=[("session", "s:1"), ("message", "queue:Q1")],
+                      text="delivery completed successfully"))
+    r2 = e.new_event(_ev(objects=[("session", "s:2"), ("message", "queue:Q1")],
+                      text="bounce notification for the morning batch"))
+    e.new_event(_ev(text="unrelated weather discussion today"))
+    out = e.activate({"text": "delivery completed",
+                      "objects": ["message:queue:Q1"]})
+    by_id = {str(x["episode_id"]): x for x in out}
+    q1 = [str(r1.episode_id), str(r2.episode_id)]
+    assert all(q in by_id for q in q1)
+    assert all(by_id[q]["person_boost"] == 1.3 for q in q1)
+    # Without the identity cue, r2 shares no text with the query and must
+    # NOT surface: this is what proves the object channel did the work,
+    # rather than the test passing on lexical overlap alone.
+    text_only = {str(x["episode_id"]) for x in
+                 e.activate({"text": "delivery completed"})}
+    assert str(r2.episode_id) not in text_only
+
+
+def test_prune_decays_object_salience():
+    e = _engine()
+    e.new_event(_ev(objects=[("session", "s:7")]))
+    o = e.store.find_object(domain_id=_did(e), kind="session", canonical_name="s:7")
+    before = float(o["salience"])
+    assert before > 0.5
+    e.store.decay_object_salience(rate=0.5)
+    after = float(e.store.find_object(
+        domain_id=_did(e), kind="session",
+        canonical_name="s:7")["salience"])
+    assert after == 0.5 + (before - 0.5) * 0.5
