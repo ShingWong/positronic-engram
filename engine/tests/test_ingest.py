@@ -436,3 +436,19 @@ def test_content_field_speaks_the_engine_text_keys():
     assert f["body_text"] == "connect from x"
     # ... while the raw fields are still there too.
     assert f["message"] == "connect from x"
+
+
+def test_object_identity_lookup_is_indexed_not_scanned():
+    """The 5-hour ingest. get_or_create_object and find_object filter
+    (domain_id, kind, canonical_name) once per record; without an index every
+    lookup scans the table, so ingest degrades linearly in objects -- measured
+    0.87ms per lookup at 5,000 objects. Assert the index exists rather than
+    timing the lookup, because timing is environment-shaped and the index is
+    the actual requirement."""
+    e = _engine()
+    idx = {r[0] for r in e.store.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+    assert "obj_lookup" in idx
+    cols = [r[2] for r in e.store.conn.execute(
+        "PRAGMA index_info(obj_lookup)").fetchall()]
+    assert cols == ["domain_id", "kind", "canonical_name"]

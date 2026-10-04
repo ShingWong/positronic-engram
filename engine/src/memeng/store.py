@@ -222,6 +222,17 @@ CREATE TABLE IF NOT EXISTS object_relation (
 );
 CREATE INDEX IF NOT EXISTS objrel_sub ON object_relation(subject_id);
 CREATE INDEX IF NOT EXISTS objrel_obj ON object_relation(object_id);
+-- The identity hot path. get_or_create_object AND find_object both filter
+-- (domain_id, kind, canonical_name), once per record at ingest and once per
+-- event at gate time. Without this index every lookup scans the table:
+-- measured 0.87ms at 5,000 objects, i.e. linear in objects, i.e. a 5-hour
+-- ingest of 331k records that should take minutes. IF NOT EXISTS, so
+-- pre-existing databases gain it on next open -- including the brain that
+-- taught us it was missing, with no re-ingest.
+CREATE INDEX IF NOT EXISTS obj_lookup
+    ON object(domain_id, kind, canonical_name);
+-- Range-and-key recall filters wall bounds; the tau indexes do not serve it.
+CREATE INDEX IF NOT EXISTS ep_wall ON episode(wall);
 
 CREATE TABLE IF NOT EXISTS object_sighting (
   episode_id TEXT,

@@ -55,6 +55,7 @@ gain with 6,367 fake people.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -62,6 +63,8 @@ from datetime import datetime
 
 from .grouping import DELIVERY, SESSION, assign
 from .models import Event
+
+logger = logging.getLogger(__name__)
 
 SESSION_KIND = "session"
 MESSAGE_KIND = "message"
@@ -211,7 +214,8 @@ def ingest_records(engine, schema: dict, records: Iterable[dict], *,
                    classify: Callable[[dict], str | None] | None = None,
                    commit_every: int = 1000,
                    group: bool = True,
-                   gap_seconds: int = 3600) -> IngestReport:
+                   gap_seconds: int = 3600,
+                   progress_every: int = 0) -> IngestReport:
     """Ingest log records under a validated schema. Returns what happened.
 
     `stream` must already be attached (the caller owns domain setup, the way
@@ -370,7 +374,15 @@ def ingest_records(engine, schema: dict, records: Iterable[dict], *,
         meta.append((canonicals[n], id_lists[n], walls[n], "message",
                      g, False))
 
-    results = engine.new_events(events, commit_every=commit_every)
+    # Progress, off by default. A 300k-record ingest with no output is
+    # indistinguishable from a hang -- measured as four identical "is it
+    # stuck?" checks during the first full pvl run, which took 70+ minutes
+    # silent. The count is records emitted to the gate, not episodes stored:
+    # the gate rejects freely, so stored-count would mislead about position.
+    if progress_every and progress_every > 0:
+        logger.warning("ingest: %d events to gate", len(events))
+    results = engine.new_events(events, commit_every=commit_every,
+                                progress_every=progress_every)
 
     # The relations pass. Sightings were already linked inside new_event;
     # this writes only the session--carried-->message edges, which need both

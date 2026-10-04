@@ -991,7 +991,8 @@ class MemoryEngine:
 
     # -- batch ingestion (single transaction, cache-warm) ----------------------
     def new_events(self, events: list[Event], *,
-                   commit_every: int = 1000) -> list[EventResult]:
+                   commit_every: int = 1000,
+                   progress_every: int = 0) -> list[EventResult]:
         out: list[EventResult] = []
         self.store.begin_batch()
         try:
@@ -1000,6 +1001,8 @@ class MemoryEngine:
                 if i % commit_every == 0:
                     self.store.commit_batch()
                     self.store.begin_batch()
+                    if progress_every and i % progress_every == 0:
+                        logger.warning("ingest: %d/%d gated", i, len(events))
             self.store.commit_batch()
         except Exception:
             self.store.commit_batch()   # flush what's done; research-mode semantics
