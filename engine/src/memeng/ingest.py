@@ -69,6 +69,16 @@ logger = logging.getLogger(__name__)
 SESSION_KIND = "session"
 MESSAGE_KIND = "message"
 CARRIED = "carried"          # session --carried--> message
+
+# Schema retention -> engine profile. keep inherits the domain default (None
+# means unstamped, not "balanced" -- the domain may change under the data).
+# keep-extended earns long_term strength; demote earns short_term; drop skips
+# ingest entirely, because a record the schema says to drop that lands in the
+# store anyway is the validator's verdict ignored by its own consumer.
+# Order matters for groups: strongest member retention wins.
+RETAIN_MAP = {"keep": None, "keep-extended": "long_term",
+              "demote": "short_term", "drop": None}
+RETAIN_ORDER = {"drop": 0, "demote": 1, "keep": 2, "keep-extended": 3}
 GROUP_TEXT_LINES = 100       # member lines quoted in a group episode
 GROUP_TEXT_BYTES = 20_000
 
@@ -85,6 +95,7 @@ class IngestReport:
     groups: int = 0              # group episodes (sessions + deliveries)
     grouped_members: int = 0     # member episodes carrying member_of
     singletons: int = 0          # groups of one: honest, not failures
+    dropped: int = 0             # records skipped by retention: drop
     arousal_source: str = "unset"
     notes: list[str] = field(default_factory=list)
 
@@ -100,6 +111,7 @@ class IngestReport:
             "groups": self.groups,
             "grouped_members": self.grouped_members,
             "singletons": self.singletons,
+            "dropped": self.dropped,
             "arousal_source": self.arousal_source,
             "notes": list(self.notes),
         }
@@ -173,8 +185,26 @@ def _content_field(schema: dict) -> str | None:
     return None
 
 
+def _retention_of(schema: dict) -> dict:
+    """Class name -> declared retention. The schema validator guarantees every
+    class declares a usable value, so an unknown here is a caller that skipped
+    validation -- fail loud, never inherit quietly."""
+    out = {}
+    for c in schema.get("classes") or []:
+        name = c.get("name")
+        ret = c.get("retention")
+        if name is not None:
+            if ret not in RETAIN_MAP:
+                raise ValueError(
+                    f"class {name!r} declares retention {ret!r}; validate "
+                    f"the schema first")
+            out[name] = ret
+    return out
+
+
 def _group_event(stream: str, g, *, recs: list[dict],
                  classes: list, arousals: list[float],
+                 retentions: list[str],
                  content_field: str | None) -> Event:
     """One episode for the whole group: session or delivery.
 
@@ -198,10 +228,13 @@ def _group_event(stream: str, g, *, recs: list[dict],
     # brain, each a returning visitor's later visit filed under a new name.
     # The episode keeps the suffixed group_canonical; the object does not.
     objs = [(SESSION_KIND if g.kind == SESSION else MESSAGE_KIND, g.key)]
+    strongest = max(retentions, key=lambda r: RETAIN_ORDER.get(r, -1),
+                      default="keep")
     feats = {
         "episode_role": "group",
         "group_canonical": canon,
         "group_kind": g.kind,
+        "group_retention": strongest,
         "member_count": len(g.members),
         "span_seconds": round(g.span_seconds, 1),
         "class_histogram": hist,
@@ -210,8 +243,13 @@ def _group_event(stream: str, g, *, recs: list[dict],
         "body_text": body,
         "arousal": (sum(arousals) / len(arousals)) if arousals else 0.0,
     }
+    # The group's profile is its strongest member's: a session holding one
+    # keep-extended bounce keeps long_term strength, because the one needle
+    # is what the group is for. A group of pure demote chatter fades fast,
+    # which is what demote means.
     return Event(stream=stream, kind=kind, wall=g.first_wall,
-                 features=feats, objects=objs)
+                 features=feats, objects=objs,
+                 profile=RETAIN_MAP.get(strongest))
 
 
 def ingest_records(engine, schema: dict, records: Iterable[dict], *,
@@ -284,21 +322,31 @@ def ingest_records(engine, schema: dict, records: Iterable[dict], *,
     top = max(freq.values()) if freq else 1
 
     # Per-record pass: wall, identity, message ids, arousal, class.
+    # retention: drop skips the record before grouping, so dropped lines form
+    # no sessions, join no deliveries, and leave no members behind. A group
+    # left with zero surviving members vanishes with them.
+    retain_of = _retention_of(schema)
+    class_rets: list[str] = []
     walls: list = []
     canonicals: list = []
     id_lists: list = []
     arousals: list = []
-    kept: list[int] = []          # batch indices that survived the clock
+    kept: list[int] = []          # batch indices that survived clock+retention
     for bi, (r, c) in enumerate(zip(batch, classes)):
         rep.records_seen += 1
         wall = _wall(r, time_field)
         if wall is None:
             rep.skipped_no_clock += 1
             continue
+        ret = retain_of.get(c, "keep")
+        if ret == "drop":
+            rep.dropped += 1
+            continue
         canonical = ":".join(str(r.get(k, "")) for k in key_fields) \
             if key_fields else None
         ids = _message_ids(schema, r, rx)
         arousal = (1.0 - freq[c] / top) if c is not None else 1.0
+        class_rets.append(ret)
         walls.append(wall)
         canonicals.append(canonical)
         id_lists.append(ids)
@@ -372,10 +420,16 @@ def ingest_records(engine, schema: dict, records: Iterable[dict], *,
                         recs=[batch[kept[p]] for p in g.members],
                         classes=[classes[kept[p]] for p in g.members],
                         arousals=[arousals[p] for p in g.members],
+                        retentions=[class_rets[p] for p in g.members],
                         content_field=content_field))
                     meta.append((None, [], walls[n], "group", g, True))
+        # The member's profile is its own class's: a demote line inside a
+        # keep-extended session still fades fast. Only the GROUP episode
+        # takes the strongest member retention (it exists to surface the
+        # needle, not the hay).
         events.append(Event(stream=stream, kind="message", wall=walls[n],
-                            features=feats, objects=objs))
+                            features=feats, objects=objs,
+                            profile=RETAIN_MAP.get(class_rets[n])))
         meta.append((canonicals[n], id_lists[n], walls[n], "message",
                      g, False))
 

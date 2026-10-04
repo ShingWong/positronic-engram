@@ -71,6 +71,12 @@ class Event:
     # feeds sender stats and actor gain in reinforce, because a log session
     # is not a correspondent.
     objects: list[tuple[str, str]] = field(default_factory=list)
+    # Retention profile override, naming a key of the engine's
+    # retention_profiles (e.g. "long_term"). Unknown names fail loud at
+    # encode time: a silently-defaulted profile would let a typo promote
+    # noise to archival or demote evidence to short_term, and neither
+    # failure would surface anywhere.
+    profile: str | None = None
     features: dict[str, Any] = field(default_factory=dict)
     fuzz_width: timedelta | None = None
 

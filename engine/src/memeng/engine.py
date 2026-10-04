@@ -550,8 +550,17 @@ class MemoryEngine:
                 if i < len(self._novelty_window) and self._novelty_window[i] == stale:
                     del self._novelty_window[i]
 
-            prof = self.retention_profiles[
-                cfg.get("retention_profile", "balanced")]
+            if event.profile is not None:
+                if event.profile not in self.retention_profiles:
+                    raise ValueError(
+                        f"unknown retention profile {event.profile!r}; "
+                        f"known: {sorted(self.retention_profiles)}")
+                prof = self.retention_profiles[event.profile]
+                prof_name = event.profile
+            else:
+                prof = self.retention_profiles[
+                    cfg.get("retention_profile", "balanced")]
+                prof_name = None
 
         for p in violations:
             bus.emit("prediction_violation", tau_stream, source=p.source,
@@ -636,6 +645,14 @@ class MemoryEngine:
                     refs = [f"{k}:{c}" for _, k, c in resolved]
                     event.features.setdefault("object_refs", refs)
                     rec.features.setdefault("object_refs", refs)
+                if prof_name is not None:
+                    # Prune resolves the profile per episode from this key,
+                    # so a keep-extended bounce keeps long_term strength
+                    # after the domain default would have expired it.
+                    # Domain default stays unstamped: inheriting silently is
+                    # correct, guessing loudly is not.
+                    event.features["retention_profile"] = prof_name
+                    rec.features["retention_profile"] = prof_name
                 self.store.insert_episode(rec, domain_id)
                 episode_id = rec.id
                 for oid, _k, _c in resolved:
@@ -1564,25 +1581,42 @@ class MemoryEngine:
                     now = cached
             if ep.tier is Tier.FLASHBULB or math.isinf(ep.strength):
                 continue
-            d_id = ep.domain_id if ep.domain_id is not None else \
-                (self.store.get_stream(ep.stream) or {}).get("domain_id")
-            if d_id not in dom_cache:
-                if d_id not in domain_row:
-                    domain_row[d_id] = self.store.get_domain(d_id) \
-                        if d_id is not None else None
-                row = domain_row[d_id]
-                pname = (row or {}).get("retention_profile") or \
-                    self.base_cfg.get("retention_profile", "balanced")
-                dom_cache[d_id] = self.retention_profiles[pname]
-            P = dom_cache[d_id]
+            # Per-episode profile first, domain default otherwise. The
+            # episode carries what its class declared; the domain is what
+            # everything else inherits. An unknown stamped name cannot occur
+            # -- new_event raises on unknown profiles -- so no fallback
+            # branch here, which would be a second silent default.
+            stamped = (ep.features or {}).get("retention_profile")
+            if isinstance(stamped, str) and stamped in self.retention_profiles:
+                P = self.retention_profiles[stamped]
+            else:
+                d_id = ep.domain_id if ep.domain_id is not None else \
+                    (self.store.get_stream(ep.stream) or {}).get("domain_id")
+                if d_id not in dom_cache:
+                    if d_id not in domain_row:
+                        domain_row[d_id] = self.store.get_domain(d_id) \
+                            if d_id is not None else None
+                    row = domain_row[d_id]
+                    pname = (row or {}).get("retention_profile") or \
+                        self.base_cfg.get("retention_profile", "balanced")
+                    dom_cache[d_id] = self.retention_profiles[pname]
+                P = dom_cache[d_id]
             p_merge, p_expire = P["prune_merge"], P["prune_expire"]
             if p_merge is None or p_expire is None:
                 continue                        # archival: episodes immortal
+            # Age floors at zero: an episode newer than `now` (explicit tau_now
+            # below the stream head, a backdated prune, a future wall stamp)
+            # has not decayed at all. Without the floor, a negative age
+            # makes the exponent positive and math.exp overflows --
+            # measured as OverflowError on a 30k-line brain pruned at
+            # tau_now=2000 with episodes at tau 136k. retain=1.0 keeps them,
+            # which is the only honest answer: the future cannot have decayed.
             if wall_axis:
                 # now = wall age in seconds; strength S is in wall seconds
-                retain = math.exp(-(now / max(ep.strength, 1e-9)))
+                age = max(0.0, now)
             else:
-                retain = math.exp(-((now - ep.tau) / max(ep.strength, 1e-9)))
+                age = max(0.0, now - ep.tau)
+            retain = math.exp(-(age / max(ep.strength, 1e-9)))
             if retain < p_expire:
                 self.store.write_residue(str(ep.id), usage_count=1,
                                          persons=ep.persons,

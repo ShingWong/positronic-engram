@@ -176,13 +176,15 @@ def test_bad_pattern_is_an_error_not_zero_ids():
 
 # ------------------------------------------------- participants
 
-def _ev(stream="d:s", persons=None, objects=None, text="hello world"):
+def _ev(stream="d:s", persons=None, objects=None, text="hello world",
+        profile=None):
     from datetime import datetime, timezone
 
     from memeng.models import Event
     return Event(stream=stream, kind="message",
                  wall=datetime(2026, 1, 1, tzinfo=timezone.utc),
                  persons=persons or [], objects=objects or [],
+                 profile=profile,
                  features={"subject_norm": text, "body_text": text,
                            "arousal": 0.0})
 
@@ -483,3 +485,178 @@ def test_split_groups_link_the_base_identity_not_the_suffix():
     names = sorted(r[0] for r in e.store.conn.execute(
         "SELECT canonical_name FROM object WHERE kind='session'").fetchall())
     assert names == ["s:1"], names
+
+
+# ------------------------------------------------- retention wiring
+
+def test_unknown_profile_fails_loud():
+    e = _engine()
+    try:
+        e.new_event(_ev(text="hello world"))
+        e2ok = True
+    except ValueError:
+        e2ok = False
+    assert e2ok  # no profile: fine, domain default applies
+    from datetime import datetime, timezone
+
+    from memeng.models import Event
+    try:
+        e.new_event(Event(stream="d:s", kind="message",
+                          wall=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                          features={"subject_norm": "x", "body_text": "x",
+                                    "arousal": 0.0},
+                          profile="keep-forever"))
+    except ValueError as ex:
+        assert "unknown retention profile" in str(ex)
+    else:
+        raise AssertionError("unknown profile silently accepted")
+
+
+def test_prune_honors_stamped_profile_over_domain():
+    """A short_term episode expires while its balanced sibling survives the
+    same prune. Without per-episode profiles both live or die by the domain,
+    and the schema's per-class retention is decoration."""
+    e = _engine()
+    # Maximally distinct: near-identical texts would be gate-rejected on
+    # novelty, which is correct gate behavior and not this test's subject.
+    # The short_term profile goes through Event.profile at encode time --
+    # the same path ingest uses -- because strength is computed at encode
+    # from the profile. Stamping features post-hoc would label short_term
+    # over balanced strength, a state no real path produces.
+    r1 = e.new_event(_ev(text="zebra invoice reconciled at midnight",
+                         profile="short_term"))
+    r2 = e.new_event(_ev(text="quarry siren tested before dawn"))
+    assert r1.verdict.encoded and r2.verdict.encoded
+    # tau_now=28 threads between the two TTLs: short_term (S=6) retains
+    # exp(-28/6)=0.009 < expire 0.02, while balanced (S=30) retains
+    # exp(-28/30)=0.39 > merge 0.35. Computed from the profile table, not
+    # chosen: there is exactly one window where the verdicts differ.
+    rep = e.prune(domain="d", tau_now=28.0)
+    # Level lives in the row, not the record: get_episode returns no level.
+    lv = {r[0]: r[1] for r in e.store.conn.execute(
+        "SELECT id, level FROM episode").fetchall()}
+    assert lv[str(r1.episode_id)] != "event", lv
+    assert lv[str(r2.episode_id)] == "event", lv
+    assert rep.expired >= 1
+
+
+def test_ingest_drop_skips_and_reports():
+    from memeng.ingest import ingest_records
+    e = _engine()
+    schema = dict(SCHEMA)
+    schema["classes"] = [{"name": "junk", "template": "noise here",
+                          "meaning": "m", "normal": True,
+                          "retention": "drop"}]
+    recs = [
+        {"ident": "s", "pid": "1", "stamp": "2026-01-01T00:00:00",
+         "message": "noise here"},
+        {"ident": "s", "pid": "1", "stamp": "2026-01-01T00:00:01",
+         "message": "connect from x"},
+    ]
+    rep = ingest_records(e, schema, recs, stream="d:s",
+                         classify=lambda r: "junk"
+                         if r["message"] == "noise here" else None)
+    assert rep.dropped == 1
+    assert rep.ingested == 1
+    import json
+    feats = [json.loads(r[0]) for r in
+             e.store.conn.execute("SELECT features_json FROM episode")]
+    assert all("noise here" not in (f.get("message") or "") for f in feats)
+
+
+def test_ingest_maps_retention_to_profile():
+    """demote stamps short_term, keep-extended stamps long_term, keep leaves
+    the domain default unstamped. Singletons: no group episode competes with
+    them for novelty, so each member's own stamp is observable."""
+    import json
+
+    from memeng.ingest import ingest_records
+    e = _engine()
+    schema = dict(SCHEMA)
+    schema["classes"] = [
+        {"name": "chat", "template": "zebra invoice", "meaning": "m",
+         "normal": True, "retention": "demote"},
+        {"name": "alarm", "template": "quarry siren", "meaning": "m",
+         "normal": False, "retention": "keep-extended"},
+        {"name": "routine", "template": "plain wallpaper",
+         "meaning": "m", "normal": True, "retention": "keep"},
+    ]
+    singles = [
+        {"ident": "a", "pid": "1", "stamp": "2026-01-01T00:00:00",
+         "message": "zebra invoice reconciled at midnight"},
+        {"ident": "b", "pid": "2", "stamp": "2026-01-01T00:00:01",
+         "message": "quarry siren tested before dawn"},
+        {"ident": "c", "pid": "3", "stamp": "2026-01-01T00:00:02",
+         "message": "plain wallpaper hung on tuesday"},
+    ]
+    by_msg = {"zebra invoice reconciled at midnight": "chat",
+              "quarry siren tested before dawn": "alarm",
+              "plain wallpaper hung on tuesday": "routine"}
+    rep = ingest_records(e, schema, singles, stream="d:s",
+                         classify=lambda r: by_msg[r["message"]])
+    assert rep.ingested == 3, rep.as_dict()
+    profs = {}
+    for (fj,) in e.store.conn.execute("SELECT features_json FROM episode"):
+        f = json.loads(fj)
+        profs[f.get("message")] = f.get("retention_profile")
+    assert profs["zebra invoice reconciled at midnight"] == "short_term"
+    assert profs["quarry siren tested before dawn"] == "long_term"
+    # keep inherits: unstamped, never a guessed default.
+    assert profs["plain wallpaper hung on tuesday"] is None
+
+
+def test_group_takes_strongest_member_retention():
+    """A session holding one keep-extended line keeps long_term strength,
+    because the needle is what the group is for -- even if some members are
+    correctly rejected as redundant with the group text."""
+    import json
+
+    from memeng.ingest import ingest_records
+    e = _engine()
+    schema = dict(SCHEMA)
+    schema["classes"] = [
+        {"name": "chat", "template": "harbor manifest",
+         "meaning": "m", "normal": True, "retention": "demote"},
+        {"name": "alarm", "template": "lighthouse fire",
+         "meaning": "m", "normal": False, "retention": "keep-extended"},
+    ]
+    recs = [
+        {"ident": "s", "pid": "1", "stamp": "2026-01-01T00:00:00",
+         "message": "harbor manifest signed twice"},
+        {"ident": "s", "pid": "1", "stamp": "2026-01-01T00:00:01",
+         "message": "harbor manifest sealed thrice"},
+        {"ident": "s", "pid": "1", "stamp": "2026-01-01T00:00:02",
+         "message": "lighthouse fire spotted offshore"},
+    ]
+    by_msg = {"harbor manifest signed twice": "chat",
+              "harbor manifest sealed thrice": "chat",
+              "lighthouse fire spotted offshore": "alarm"}
+    rep = ingest_records(e, schema, recs, stream="d:s",
+                         classify=lambda r: by_msg[r["message"]])
+    assert rep.groups == 1, rep.as_dict()
+    groups = [json.loads(fj) for (fj,) in e.store.conn.execute(
+        "SELECT features_json FROM episode "
+        "WHERE json_extract(features_json,'$.episode_role')='group'")]
+    assert len(groups) == 1
+    assert groups[0]["retention_profile"] == "long_term", groups[0]
+    assert groups[0]["group_retention"] == "keep-extended"
+
+
+
+
+def test_prune_with_stale_tau_now_keeps_future_episodes():
+    """An episode newer than `now` has not decayed, not overflowed.
+    Pruning at an explicit tau_now far below the stream head used to raise
+    OverflowError (negative age -> positive exponent -> math.exp blows up).
+    Measured on a 30k-line brain pruned at tau_now=2000 with episodes at
+    tau 136k; reproduced here with tau_now far negative so the exponent
+    overflows without the clamp."""
+    e = _engine()
+    r1 = e.new_event(_ev(text="zebra invoice reconciled at midnight"))
+    assert r1.verdict.encoded
+    eid = str(r1.episode_id)
+    rep = e.prune(domain="d", tau_now=-100000.0)
+    assert rep.expired == 0
+    lv = dict(e.store.conn.execute(
+        "SELECT id, level FROM episode").fetchall())[eid]
+    assert lv == "event"
