@@ -72,24 +72,24 @@ open via the store migration path.
 
 ## Retention profiles — pick a curve
 
-Same 55 messages, 78 weeks, four policies (`engine.py:48`):
+Same 55 messages, 78 weeks, four policies (`engine/src/memeng/engine.py`, `default_config` + `retention_profiles`):
 
 | Profile | S_base | Horizon | @Week 78 |
 |---|---|---|---|
 | `balanced` | 30 | weeks | 35 / 55 |
 | `long_term` | 120 | months | 55 / 55 |
 | `archival` | 1e6 | forever | 55 / 55 |
-| `short_term` | 6 | days | 7 / 55 |
+| `short_term` | 6 | days | 11 / 55 |
 
 > **Demotion, not deletion.** Episodes below 0.35 drop to `day_token`; below 0.05 to `week_token` — they are never deleted (`expired` stays 0). The `@Week 78` column counts only `level="event"` episodes remaining after `prune()`.
 
-`balanced` is the everyday default. `archival` never forgets — it grows forever, so it's gated behind a confirm. Pruning follows a weekly ladder: `0.35 → day_token 0.05 → expired` (`engine.py:443`).
+`balanced` is the everyday default. `archival` never forgets — it grows forever, so it's gated behind a confirm. Pruning follows a weekly ladder: `0.35 → day_token 0.05 → expired` (`MemoryEngine.prune`). Per-episode override: `Event(profile=...)` stamps one of the same profiles onto a single episode (schema-driven retention), and `prune(decay_axis="wall")` reads the same strengths as day-scale horizons -- volume-independent forgetting for log brains.
 
 ---
 
 ## Retention profile knobs — tuning reference
 
-Every knob resolves per-domain (via `register_domain(..., retention_profile=...)`), so one brain can mix policies. The authoritative copy of this reference lives in the source docstring at `engine.py:71`; this section is the project-facing version for agents and contributors.
+Every knob resolves per-domain (via `register_domain(..., retention_profile=...)`), so one brain can mix policies. The authoritative copy of this reference lives in the source docstring at `engine/src/memeng/engine.py` (`retention_profiles`); this section is the project-facing version for agents and contributors.
 
 ### Episode decay — the verbatim event log
 
@@ -205,11 +205,14 @@ engine.attach_stream("positronic:kairos", "kairos")
 engine.new_event(Event(
     stream="positronic:kairos",
     kind="message",
-    persons=["p_0001"],
+    persons=["p_0001"],                     # human actors only
+    objects=[("session", "postfix/smtpd:17810")],  # schema identities (log sessions, queue ids, ...)
+    profile="long_term",                      # optional per-episode retention override
     features={"subject_norm": "liqui-fire rx", "body_text": "...", "arousal": 0.7},
 ))
 
 hits = engine.activate({"text": "liqui-fire"}, k=8)
+dossier = engine.recall_object("message", "queue:303B1142F0D37")  # one identity's life + handoffs
 ```
 
 Install (from the engine directory):
@@ -234,17 +237,15 @@ pip install -e engine   # or: pip install --break-system-packages -e engine
 
 ## Benchmarks
 
-- **E7 synthetic** — 55 events → 78 weeks → `55/55/35/7` (`archival/long_term/balanced/short_term`), `profile_order_ok`, 14 unit tests green.
-- **LongMemEval real `n=50`** — `archival/local` `0.58` vs `0.14` without → `Δ 0.44`, `fallback 0.0`, `recall 1.0` (clean single run).
+- **E7 synthetic** — 55 events → 78 weeks → `55/55/35/11` (`archival/long_term/balanced/short_term`; committed fig `papers/.../arxiv/figs/e7_survival.pdf`).
+- **LongMemEval real `n=50`** — `archival/local` `0.90` vs `0.12` without → `Δ 0.78`, `fallback 0.0`, `recall 1.0` (committed `figs/metrics-50.json`).
 - **RULER 4–32k** — top-8 retrieval flat `242 tok` vs growing full haystack (`2.2k–18k tok`) → `1/10`–`1/74` context, recall@1 1.0 preserved.
 - **Throughput** — ~6k events/s synthetic batch ingestion (H14 gate economics: ~5% encode rate on realistic mix).
 
 Run them yourself:
 
 ```bash
-cd engine
-pytest -q            # engine unit tests
-python3 -m pytest ../consumers/benchmarks/tests/test_synthetic_e7.py -q
+pytest engine/tests/   # from the repo root; engine unit tests
 ```
 
 ---
@@ -253,9 +254,9 @@ python3 -m pytest ../consumers/benchmarks/tests/test_synthetic_e7.py -q
 
 - **[positronic-opencode-plugin](https://github.com/ShingWong/positronic-opencode-plugin)** — the opencode plugin that uses this engine (`/positronic:*`, `positronic.*`, CLI).
 - **[positronic-research](https://github.com/ShingWong?tab=repositories)** — the paper and benchmark harness: `papers/temporal-perception-in-AI/`, `consumers/benchmarks/`.
-- **This engine** — `engine/src/memeng/` (`engine.py`, `store.py`, `models.py`, `triggers.py`, `fuzzy.py`, `vision.py`, `entities.py`, `telemetry.py`).
+- **This engine** — `engine/src/memeng/` (`engine.py`, `store.py`, `models.py`, `ingest.py`, `grouping.py`, `triggers.py`, `fuzzy.py`, `vision.py`, `entities.py`, `telemetry.py`).
 
-`ENGRAM_TAG=v0.2.0` pins the version used by benchmarks and the plugin.
+Tagged releases (`v0.2.0`, `v0.2.1`, `v0.3.0`); benchmarks cite the tag that produced them, and PAI pins `v0.3.0`.
 
 ---
 
