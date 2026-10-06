@@ -166,7 +166,7 @@ Objects are SQLite rows with embeddings, characteristics, and update history —
 Two honest numbers, two different layers:
 
 - **The store** — `p95 0.7 ms` on the synthetic harness. SQLite + FTS5 + RRF → the "0.5–2 ms" you see in demos.
-- **The full pipeline** — `p95 ~210 s` end-to-end on real LongMemEval `n=50` (ingest ~550 messages, embed, two LLM passes, judge). Recall `0.58` with memory vs `0.14` without → **Δ 0.44**.
+- **The full pipeline** — per-question median ~73 s end-to-end on real LongMemEval `n=500` (ingest ~500 messages, embed, two LLM passes, judge; run at ambient load ~60). Retrieval sub-component ~135 ms median. Recall `1.000` with memory in 500 trials; accuracy `0.262` vs `0.202` → **Δ +0.060**, extraction-capped.
 
 Bonus: top-8 retrieval uses a flat **~242 tokens** vs the full haystack (which grows from **~2,249** at 4k to **~18,000** at 32k) — about **1/10th to 1/74th** of the context, with recall@1 1.0.
 
@@ -239,6 +239,7 @@ pip install -e engine   # or: pip install --break-system-packages -e engine
 
 - **E7 synthetic** — 55 events → 78 weeks → `55/55/35/11` (`archival/long_term/balanced/short_term`; committed fig `papers/.../arxiv/figs/e7_survival.pdf`).
 - **LongMemEval real `n=50`** — `archival/local` `0.90` vs `0.12` without → `Δ 0.78`, `fallback 0.0`, `recall 1.0` (committed `figs/metrics-50.json`).
+- **LongMemEval full `n=500`** — same protocol, all six types: `recall 1.000`, `acc 0.262` vs `0.202`, `fallback 0.000` (committed `figs/metrics-500.json`). Weakest on temporal-reasoning (0.180); retrieval never failed.
 - **RULER 4–32k** — top-8 retrieval flat `242 tok` vs growing full haystack (`2.2k–18k tok`) → `1/10`–`1/74` context, recall@1 1.0 preserved.
 - **Throughput** — ~6k events/s synthetic batch ingestion (H14 gate economics: ~5% encode rate on realistic mix).
 
