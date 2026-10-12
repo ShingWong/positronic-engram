@@ -276,16 +276,51 @@ CREATE TABLE IF NOT EXISTS residue (
 
 
 class SQLiteStore:
-    def __init__(self, path: str = ":memory:") -> None:
+    # PRAGMA synchronous values. `full` is the default on purpose: a brain is
+    # the primary record and archival profiles promise never to forget, so a
+    # crash must not cost recent commits. `normal` trades that for throughput
+    # and is only coherent under WAL.
+    _SYNC = {"full": 2, "normal": 1}
+
+    def __init__(self, path: str = ":memory:", *,
+                 durability: str = "full") -> None:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self._in_batch = False
         self._rules_cache: dict[int, list[dict]] = {}
         self._person_cache: dict[str, dict | None] = {}
         self._stream_cache: dict[str, dict | None] = {}
+        self._set_durability(durability)
         self.conn.executescript(_DDL)
         self._migrate()
         self._commit()
+
+    def _set_durability(self, durability: str) -> None:
+        """Set PRAGMA synchronous for this connection.
+
+        synchronous is per-connection and is NOT persisted in the file, unlike
+        journal_mode. Tuning it once via a CLI therefore evaporates the moment
+        any process opens the store -- which is how a brain silently sits at
+        the SQLite default while its operator believes it was tuned. It has to
+        be set in code, at open, every time.
+
+        `normal` implies WAL: the pairing is what makes skipping the per-COMMIT
+        fsync survivable, so opting in enables WAL rather than refusing.
+        """
+        if durability not in self._SYNC:
+            raise ValueError(
+                f"durability must be one of {sorted(self._SYNC)}, "
+                f"got {durability!r}")
+        if durability == "normal":
+            mode = str(self.conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            if mode != "wal":
+                self.conn.execute("PRAGMA journal_mode=WAL")
+                mode = str(self.conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                if mode != "wal":
+                    raise ValueError(
+                        f"durability='normal' needs WAL, this store stayed {mode!r}")
+        self.conn.execute(f"PRAGMA synchronous={self._SYNC[durability]}")
+        self.durability = durability
 
     def _migrate(self) -> None:
         """Lightweight additive migrations for pre-existing databases."""
