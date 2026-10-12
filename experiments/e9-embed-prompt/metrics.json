@@ -1,0 +1,51 @@
+{
+ "variants": {
+  "V1": {
+   "sel_acc": 0.95,
+   "sel_mrr": 0.9637,
+   "eva_acc": 0.952,
+   "eva_mrr": 0.9622
+  },
+  "V2": {
+   "sel_acc": 0.958,
+   "sel_mrr": 0.9712,
+   "eva_acc": 0.963,
+   "eva_mrr": 0.9763
+  },
+  "V3": {
+   "sel_acc": 0.96,
+   "sel_mrr": 0.971,
+   "eva_acc": 0.959,
+   "eva_mrr": 0.9707
+  },
+  "V4": {
+   "sel_acc": 0.91,
+   "sel_mrr": 0.9285,
+   "eva_acc": 0.906,
+   "eva_mrr": 0.9262
+  },
+  "V5": {
+   "sel_acc": 0.956,
+   "sel_mrr": 0.9699,
+   "eva_acc": 0.961,
+   "eva_mrr": 0.9718
+  },
+  "V6": {
+   "sel_acc": 0.958,
+   "sel_mrr": 0.9681,
+   "eva_acc": 0.959,
+   "eva_mrr": 0.9668
+  }
+ },
+ "winner_sel": "V2",
+ "bge_eva": {
+  "acc": 0.979,
+  "mrr": 0.986
+ },
+ "mcnemar": {
+  "b10": 9,
+  "b01": 2,
+  "p": 0.0654
+ },
+ "gate": "FAIL BGE stays"
+}

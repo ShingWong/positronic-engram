@@ -1,0 +1,25 @@
+{
+ "n_queries": 915,
+ "n_candidates": 9122,
+ "bge": {
+  "acc@1": 0.978,
+  "mrr": 0.985
+ },
+ "eg2": {
+  "acc@1": 0.953,
+  "mrr": 0.968
+ },
+ "lexical": {
+  "acc@1": 0.119,
+  "mrr": 0.208,
+  "misses": 806,
+  "eg2_acc_on_lexmiss": 0.957,
+  "note": "unrestricted: includes 9246 unclassified distractor lines, as in deployment"
+ },
+ "lexical_restricted": {
+  "acc@1": 0.191,
+  "mrr": 0.307,
+  "note": "same candidate space as dense (labelled messages only)"
+ },
+ "gate": "FAIL clause 1: EG2 MRR 0.968 < BGE MRR 0.985. Do not swap; BGE stays."
+}

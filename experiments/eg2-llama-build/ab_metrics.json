@@ -1,0 +1,14 @@
+{
+ "a_raw_raw": {
+  "R@1": 0.917,
+  "MRR": 0.958
+ },
+ "b_prompted_prompted": {
+  "R@1": 0.917,
+  "MRR": 0.958
+ },
+ "c_promptedDocs_rawQueries": {
+  "R@1": 0.917,
+  "MRR": 0.958
+ }
+}

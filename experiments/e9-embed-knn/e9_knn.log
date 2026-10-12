@@ -1,0 +1,27 @@
+labelled messages: 10037
+queries: 915, candidates: 9122
+embedding BGE candidates...
+embedding BGE queries...
+BGE acc@1=0.978 MRR=0.985
+embedding EG2 candidates...
+embedding EG2 queries...
+EG2 acc@1=0.953 MRR=0.968
+LEX acc@1=0.119 misses=806 EG2-on-lexmiss=0.957
+{
+ "n_queries": 915,
+ "n_candidates": 9122,
+ "bge": {
+  "acc@1": 0.978,
+  "mrr": 0.985
+ },
+ "eg2": {
+  "acc@1": 0.953,
+  "mrr": 0.968
+ },
+ "lexical": {
+  "acc@1": 0.119,
+  "mrr": 0.208,
+  "misses": 806,
+  "eg2_acc_on_lexmiss": 0.957
+ }
+}

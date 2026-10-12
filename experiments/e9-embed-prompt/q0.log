@@ -1,0 +1,7 @@
+queries=915 candidates=9122
+embed BGE...
+embed EG2...
+BGE acc=0.978 MRR=0.985 | EG2 acc=0.953 MRR=0.968
+McNemar: b10=25 b01=2 exact two-sided p=0.0000
+overlap: both-hit=870 both-miss=18
+MRR diff (BGE-EG2)=0.0173 95% CI=[0.0106,0.0248]

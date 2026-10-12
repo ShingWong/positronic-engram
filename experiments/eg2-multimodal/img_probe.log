@@ -1,0 +1,15 @@
+embedding images...
+image-image cos(red,blue)=0.862
+embedding queries...
+--- queries raw ---
+Q'a red square': sims=[0.749, 0.624, 0.613, 0.613] best=sq_red.png OK
+Q'a blue circle': sims=[0.586, 0.722, 0.564, 0.525] best=ci_blue.png OK
+Q'a green triangle': sims=[0.59, 0.569, 0.764, 0.591] best=tr_green.png OK
+Q'a cat': sims=[0.6, 0.596, 0.596, 0.688] best=cat.png OK
+raw: 4/4 diagonal
+--- queries prompted ---
+Q'a red square': sims=[0.78, 0.641, 0.641, 0.641] best=sq_red.png OK
+Q'a blue circle': sims=[0.623, 0.778, 0.621, 0.578] best=ci_blue.png OK
+Q'a green triangle': sims=[0.627, 0.611, 0.805, 0.639] best=tr_green.png OK
+Q'a cat': sims=[0.617, 0.62, 0.613, 0.74] best=cat.png OK
+prompted: 4/4 diagonal

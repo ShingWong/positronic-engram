@@ -1,0 +1,55 @@
+Invoice #000023
+Date:
+10/17/2024
+Due Date:10/24/2024
+Terms:
+Net 7
+
+SerSar Group, Inc.
+
+Shing Wong
+
+Accounts Payable
+4770 W I-10 Service Rd S
+Metairie, LA 70001
+
+Date
+10/17/2024
+
+3727 Saratoga Dr.
+Metairie, LA 70002
+504-913-6502
+9126502@gmail.com
+swong
+Description
+
+Setup new laptop for sam, and labor for GFX work
+
+Net Price
+Tax
+
+Quantity
+
+Unit Price
+
+1.00
+
+$950.00
+
+Total
+$950.00
+
+$950.00
+$0.00
+
+Total Price
+
+$950.00
+
+Amount Due
+
+$950.00
+
+Thank you for your patronage!
+
+

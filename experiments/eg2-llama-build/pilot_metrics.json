@@ -1,0 +1,14 @@
+{
+ "bge_8090": {
+  "records": 1000,
+  "seconds": 116.4,
+  "records_per_s": 8.6,
+  "projected_189k_h": 6.12
+ },
+ "eg2_8091": {
+  "records": 1000,
+  "seconds": 104.7,
+  "records_per_s": 9.5,
+  "projected_189k_h": 5.51
+ }
+}
