@@ -1,0 +1,14 @@
+{
+ "edges": [],
+ "log": [
+  {
+   "step": 0,
+   "screen": "afk_popup"
+  },
+  {
+   "step": 1,
+   "screen": "afk_popup",
+   "note": "esc-resistant"
+  }
+ ]
+}
