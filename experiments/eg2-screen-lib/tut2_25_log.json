@@ -1,0 +1,16 @@
+[
+ {
+  "i": 0,
+  "screen": "hero_details",
+  "ask1": "TAP 960 430 REASON The tutorial prompt \"Upgrade Heroes, Enhance Combat Strength\" highlights the \"+\" upgrade button next to the EXP/level panel, which is the action to advance the tutorial."
+ },
+ {
+  "i": 0,
+  "confirm": "TAP 820 590"
+ },
+ {
+  "i": 1,
+  "screen": null,
+  "ask1": "DONE"
+ }
+]

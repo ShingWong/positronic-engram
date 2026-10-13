@@ -41,3 +41,10 @@
   NOTE: /etc/llama-vision.config has the same latent bug.
 - Verified: red-query vs red-image cos 0.780 under unit (was 0.749-0.78 manual).
   Identical vectors. Manual server retired.
+
+## Path 2 executed on bot16 2026-10-13
+- BLOCKED hero tutorial (EXP 0/100): opened skip dialog via + zone (1100,375),
+  tapped Skip (705,560), banner+SKIP gone, hero_details clean returned.
+- identify() blind throughout (hero_details before/during/after) — banner
+  checks must run on every goto entry + hop landing, not just None.
+- Wiring proposal: tutorial_nav_PROPOSAL.py (wrapper + 3 merge points).
