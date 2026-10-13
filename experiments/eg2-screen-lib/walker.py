@@ -56,6 +56,7 @@ screen, vec, frame = snap(s, gw, "w000")
 log.append({"step": 0, "screen": screen})
 print(f"start: {screen}", flush=True)
 prev = screen
+seen = set()
 for i in range(1, STEPS + 1):
     changed = False
     for attempt in range(MAX_ESC):

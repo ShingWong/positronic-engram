@@ -1,11 +1,6 @@
 {
  "edges": [
   {
-   "from": "shelter_view",
-   "action": "esc",
-   "to": "exit_dialog"
-  },
-  {
    "from": "exit_dialog",
    "action": "esc",
    "to": "shelter_view"
@@ -14,105 +9,25 @@
    "from": "shelter_view",
    "action": "esc",
    "to": "exit_dialog"
-  },
-  {
-   "from": "exit_dialog",
-   "action": "esc",
-   "to": "shelter_view"
-  },
-  {
-   "from": "shelter_view",
-   "action": "esc",
-   "to": "exit_dialog"
-  },
-  {
-   "from": "exit_dialog",
-   "action": "esc",
-   "to": "shelter_view"
-  },
-  {
-   "from": "shelter_view",
-   "action": "esc",
-   "to": "exit_dialog"
-  },
-  {
-   "from": "exit_dialog",
-   "action": "esc",
-   "to": "shelter_view"
-  },
-  {
-   "from": "shelter_view",
-   "action": "esc",
-   "to": "exit_dialog"
-  },
-  {
-   "from": "exit_dialog",
-   "action": "esc",
-   "to": "shelter_view"
-  },
-  {
-   "from": "shelter_view",
-   "action": "esc",
-   "to": "exit_dialog"
-  },
-  {
-   "from": "exit_dialog",
-   "action": "esc",
-   "to": "shelter_view"
   }
  ],
  "log": [
   {
    "step": 0,
-   "screen": "shelter_view"
+   "screen": "exit_dialog"
   },
   {
    "step": 1,
-   "screen": "exit_dialog"
+   "screen": "shelter_view"
   },
   {
    "step": 2,
-   "screen": "shelter_view"
+   "screen": "exit_dialog"
   },
   {
    "step": 3,
-   "screen": "exit_dialog"
-  },
-  {
-   "step": 4,
-   "screen": "shelter_view"
-  },
-  {
-   "step": 5,
-   "screen": "exit_dialog"
-  },
-  {
-   "step": 6,
-   "screen": "shelter_view"
-  },
-  {
-   "step": 7,
-   "screen": "exit_dialog"
-  },
-  {
-   "step": 8,
-   "screen": "shelter_view"
-  },
-  {
-   "step": 9,
-   "screen": "exit_dialog"
-  },
-  {
-   "step": 10,
-   "screen": "shelter_view"
-  },
-  {
-   "step": 11,
-   "screen": "exit_dialog"
-  },
-  {
-   "step": 12,
-   "screen": "shelter_view"
+   "screen": "shelter_view",
+   "note": "loop"
   }
  ]
 }
