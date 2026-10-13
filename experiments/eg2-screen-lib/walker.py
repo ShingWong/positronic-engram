@@ -67,6 +67,12 @@ for i in range(1, STEPS + 1):
             break
         prev_poll = cur
     if changed:
+        key = (prev, "esc", cur)
+        if key in seen:
+            print(f"step {i}: loop detected ({prev} --esc--> {cur} seen before), stop", flush=True)
+            log.append({"step": i, "screen": cur, "note": "loop"})
+            break
+        seen.add(key)
         edges.append({"from": prev, "action": "esc", "to": cur})
         print(f"step {i}: EDGE {prev} --esc--> {cur}", flush=True)
         prev = cur
