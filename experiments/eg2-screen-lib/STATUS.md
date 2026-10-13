@@ -32,3 +32,12 @@
 - Doctrine: fixed-location banners -> template patch (this); unknown overlays ->
   contour localize + EG2 crop-name; genuinely new screens -> Qwen-name + bank.
   Each layer handles what the layer below cannot see.
+
+## Systemd cutover 2026-10-13
+- Models moved to /usr/local/devel/models/embedding/ (text 310MB + mmproj 555MB).
+- /etc/llama-eg2.config + llama-eg2.service created, enabled, active.
+- Gotcha: $VAR inside EXTRA_OPTIONS does NOT expand from EnvironmentFile
+  (mmproj failed to load as literal '$MMPROJ_FILE'); path inlined.
+  NOTE: /etc/llama-vision.config has the same latent bug.
+- Verified: red-query vs red-image cos 0.780 under unit (was 0.749-0.78 manual).
+  Identical vectors. Manual server retired.
