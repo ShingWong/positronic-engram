@@ -24,3 +24,11 @@
 - Qwen suggested SKIP or upgrade target (reasoning cut by token budget).
 - Stopped blind-tapping after 4 misses. Next candidates: grenade icon,
   precise EXP "+" coords, or Qwen with bigger budget.
+
+## Fixed-banner template check 2026-10-13
+- 10% patch of hero-upgrade banner (t00 rect 677,349,475,135 -> patch 840,395,150,45):
+  banner frames 1.000 / all others <=0.492 (skip dialogs 0.49, sky 0.21).
+  Threshold 0.75, huge margin. ms on CPU, no GPU.
+- Doctrine: fixed-location banners -> template patch (this); unknown overlays ->
+  contour localize + EG2 crop-name; genuinely new screens -> Qwen-name + bank.
+  Each layer handles what the layer below cannot see.
