@@ -1,5 +1,0 @@
-start: exit_dialog
-step 1: EDGE exit_dialog --esc--> shelter_view
-step 2: EDGE shelter_view --esc--> exit_dialog
-step 3: loop detected (exit_dialog --esc--> shelter_view seen before), stop
-done: 2 edges

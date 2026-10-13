@@ -1,7 +1,0 @@
-iter 0 screen=hero_details
-  TAP 960 430 REASON The tutorial prompt "Upgrade Heroes, Enhance Combat Strength" highlights the "+" upgrade button next to the EXP/level panel, which is the action to advance the tutorial.
-  tap (1107, 398) (crop @ (905, 221))
-iter 1 screen=None
-  DONE
-tutorial clear
-log written

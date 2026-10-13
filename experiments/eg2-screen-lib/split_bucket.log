@@ -1,9 +1,0 @@
-20/84
-40/84
-60/84
-80/84
-cluster 0: n=10 labels=['?'] e.g. after_click.png
-cluster 1: n=59 labels=['start_norah'] e.g. frames/f000.png
-cluster 2: n=2 labels=['?', 'start_norah'] e.g. frames/f014.png
-cluster 3: n=7 labels=['?'] e.g. walk_frames/w000.png
-cluster 4: n=6 labels=['?'] e.g. walk_frames/w001_e0.png
