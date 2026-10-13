@@ -14,3 +14,13 @@
   9 no-out-edge screens, descriptions complete.
 - Bot17 parked on shelter_view (post exit_dialog cancel).
 - EG2 :8091 + mmproj up. Qwen3.8-27B :8080 now completion+multimodal (6.6s/describe).
+
+## Tutorial attempt 2026-10-13 (hero_details, "Upgrade Heroes" banner)
+- up-arrow (1085,315): no change. Skill button (1020,730): no change.
+  fist icon (1090,625): no change. Hero Talent (855,730): no change.
+- "+" tap hit SKIP's hitbox -> "Skip Tutorial? Cancel/Skip" dialog
+  (identify=None: genuine unknown-screen candidate, saved tutorial_skip_dialog.png).
+  Cancelled back to hero_details, tutorial intact.
+- Qwen suggested SKIP or upgrade target (reasoning cut by token budget).
+- Stopped blind-tapping after 4 misses. Next candidates: grenade icon,
+  precise EXP "+" coords, or Qwen with bigger budget.
