@@ -896,6 +896,21 @@ class MemoryEngine:
                     weights.append(1.0)
 
             eps_by_id: dict[str, Any] = {}
+            # Drop superseded episodes from every channel before fusion (the
+            # vector channel reads the embedding table directly, so filtering
+            # at the FTS source alone cannot reach it). One indexed read per
+            # activate; dead copies never occupy fused slots or top-k.
+            all_ids = [eid for ch in channels for eid in ch]
+            sup_ids = self.store.superseded_ids(all_ids)
+            if sup_ids:
+                paired = [(ch, w) for ch, w in zip(channels, weights)]
+                channels = []
+                weights = []
+                for ch, w in paired:
+                    live_ch = [eid for eid in ch if eid not in sup_ids]
+                    if live_ch:
+                        channels.append(live_ch)
+                        weights.append(w)
             for ch in channels:
                 for eid in ch:
                     if eid not in eps_by_id:

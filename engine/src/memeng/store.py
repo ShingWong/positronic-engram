@@ -360,6 +360,15 @@ class SQLiteStore:
             self.conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS episode_fts USING fts5("
                 "id UNINDEXED, text_content)")
+        # The message_id dedup probe (ops.ingest._dup_result and any
+        # idempotent ingest) is an equality on a JSON path — without this
+        # expression index every probe is a full table scan. Measured on a
+        # 191k-episode brain: 1.2s to build once, and the CVE re-ingest
+        # validation went from write-bound 106.6/s to 3,513.9/s on the
+        # probe-only pass.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS ep_msgid ON episode("
+            "json_extract(features_json,'$.message_id'))")
 
     def _commit(self) -> None:
         if not self._in_batch:
@@ -767,20 +776,37 @@ class SQLiteStore:
 
     def fts_search(self, query: str, k: int = 8,
                    kind: str | None = None) -> list[str]:
+        # Superseded episodes (features_json.superseded_by set by dedup
+        # reconciliation) are archival history, not retrievable content:
+        # they must never spend a pool slot on a dead copy.
+        live = "AND json_extract(e.features_json,'$.superseded_by') IS NULL"
         try:
             if kind:
                 rows = self.conn.execute(
                     "SELECT f.id FROM episode_fts f "
                     "JOIN episode e ON e.id = f.id "
-                    "WHERE episode_fts MATCH ? AND e.kind = ? "
+                    f"WHERE episode_fts MATCH ? AND e.kind = ? {live} "
                     "ORDER BY rank LIMIT ?", (query, kind, k)).fetchall()
             else:
                 rows = self.conn.execute(
-                    "SELECT id FROM episode_fts WHERE episode_fts MATCH ? "
+                    "SELECT f.id FROM episode_fts f "
+                    "JOIN episode e ON e.id = f.id "
+                    f"WHERE episode_fts MATCH ? {live} "
                     "ORDER BY rank LIMIT ?", (query, k)).fetchall()
         except sqlite3.Error:
             return []
         return [r["id"] for r in rows]
+
+    def superseded_ids(self, ids: list[str]) -> set[str]:
+        """Which of these episodes are marked superseded (dedup reconcile)."""
+        if not ids:
+            return set()
+        marks = self.conn.execute(
+            "SELECT id FROM episode WHERE id IN "
+            f"({','.join('?' * len(ids))}) "
+            "AND json_extract(features_json,'$.superseded_by') IS NOT NULL",
+            tuple(ids)).fetchall()
+        return {r[0] for r in marks}
 
     def bump_cooccurrence(self, stream: str, pair_key: str,
                           assoc_val: str) -> tuple[int, str, int]:
